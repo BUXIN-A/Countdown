@@ -112,9 +112,9 @@ void HitokotoManager::FetchNext() {
 }
 
 // ---------------------------------------------------------------------------
-// 本地语句
+// 本地语句：hitokoto 文件夹内所有 .txt，每行一句
 // ---------------------------------------------------------------------------
-static void WriteDefaultLocalFile(const std::wstring& path) {
+static bool WriteDefaultLocalFile(const std::wstring& path) {
     const wchar_t* lines[] = {
         L"\u7eb5\u6709\u75be\u98ce\u8d77\uff0c\u4eba\u751f\u4e0d\u8a00\u5f03\u3002",           // 纵有疾风起，人生不言弃。
         L"\u4fdd\u6301\u70ed\u7231\uff0c\u5954\u8d74\u5c71\u6d77\u3002",                       // 保持热爱，奔赴山海。
@@ -122,48 +122,48 @@ static void WriteDefaultLocalFile(const std::wstring& path) {
         L"\u8def\u867d\u8fdc\uff0c\u884c\u5219\u5c06\u81f3\uff1b\u4e8b\u96be\uff0c\u505a\u5219\u5fc5\u6210\u3002", // 路虽远，行则将至；事虽难，做则必成。
         L"\u957f\u98ce\u7834\u6d6a\u4f1a\u6709\u65f6\uff0c\u76f4\u6302\u4e91\u5e06\u6d4e\u6ca7\u6d77\u3002",     // 长风破浪会有时，直挂云帆济沧海。
     };
-    std::string out;
+    std::wstring text;
     for (auto* s : lines) {
-        out += utils::WideToUtf8(s);
-        out += '\n';
+        text += s;
+        text += L'\n';
     }
-    std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
-    if (ofs) ofs.write(out.data(), static_cast<std::streamsize>(out.size()));
+    return utils::WriteTextFile(path, text);
 }
 
 void HitokotoManager::LoadLocal() {
     local_.clear();
-    std::wstring path = utils::GetExeDir() + L"hitokoto_local.txt";
+    std::wstring dir = utils::GetExeDir() + L"hitokoto";
+    utils::EnsureDirectory(dir);
 
-    std::ifstream ifs(path, std::ios::binary);
-    if (!ifs) {
-        // 文件不存在：生成默认语句文件后重读
+    std::vector<std::wstring> files = utils::ListTxtFiles(dir);
+    if (files.empty()) {
+        // 文件夹为空：生成 default.txt 后使用
         CreateDefaultLocalFile();
-        ifs.open(path, std::ios::binary);
-        if (!ifs) return;
+        files = utils::ListTxtFiles(dir);
     }
-    // 读取大小上限：正常语句文件仅数 KB；超过 512KB 视为异常，
-    // 只读前 512KB，防御意外超大文件一次性占满内存
-    const std::streamsize kMaxLocalBytes = 512 * 1024;
-    std::string content;
-    content.resize(kMaxLocalBytes);
-    std::streamsize got = ifs.read(&content[0], kMaxLocalBytes).gcount();
-    content.resize(static_cast<size_t>(got));
 
-    std::wistringstream ss(utils::Utf8ToWide(content));
-    std::wstring line;
-    while (std::getline(ss, line)) {
-        // 去除行尾 \r 与首尾空白
-        while (!line.empty() && (line.back() == L'\r' || line.back() == L' ' || line.back() == L'\t'))
-            line.pop_back();
-        while (!line.empty() && (line.front() == L' ' || line.front() == L'\t'))
-            line.erase(line.begin());
-        if (!line.empty()) local_.push_back(line);
+    for (const auto& file : files) {
+        std::wstring content;
+        // 单个文件读取上限 512KB，防御异常超大文件
+        if (!utils::ReadTextFile(file, content, 512 * 1024)) continue;
+
+        std::wistringstream ss(content);
+        std::wstring line;
+        while (std::getline(ss, line)) {
+            // 去除行尾 \r 与首尾空白
+            while (!line.empty() && (line.back() == L'\r' || line.back() == L' ' || line.back() == L'\t'))
+                line.pop_back();
+            while (!line.empty() && (line.front() == L' ' || line.front() == L'\t'))
+                line.erase(line.begin());
+            if (!line.empty()) local_.push_back(line);
+        }
     }
 }
 
 void HitokotoManager::CreateDefaultLocalFile() {
-    WriteDefaultLocalFile(utils::GetExeDir() + L"hitokoto_local.txt");
+    std::wstring dir = utils::GetExeDir() + L"hitokoto";
+    utils::EnsureDirectory(dir);
+    WriteDefaultLocalFile(dir + L"\\default.txt");
 }
 
 void HitokotoManager::TakeLocal() {

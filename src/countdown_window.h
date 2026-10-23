@@ -10,6 +10,7 @@
 #include "config.h"
 #include "tray.h"
 #include "hitokoto.h"
+#include "article_window.h"
 
 class CountdownWindow {
 public:
@@ -42,8 +43,22 @@ private:
     void OnCreate();
     void OnTimer();
     void OnDestroy();
+    void OnDpiChanged();
     void Reposition();
     void ApplyRoundedRegion();
+
+    // 逻辑像素 -> 当前 DPI 物理像素
+    int S(int value) const;
+
+    // 供布局/绘制共用的字号（物理像素）
+    int TitleFontPx() const;
+    int ContentFontPx() const;
+    int TargetFontPx() const;
+    int HkBaseFontPx() const;
+
+    // 复用整窗 DIB（尺寸变化时才重建），避免每帧分配
+    bool EnsureDib(int w, int h);
+    void ReleaseDib();
 
     // 使用 UpdateLayeredWindow 重绘整个窗口（支持一言区域局部 alpha 渐变）
     void Render();
@@ -66,8 +81,24 @@ private:
     HICON icon_   = nullptr;
     Tray  tray_;
     Config config_;
+    ArticleWindow article_;
     UINT_PTR timer_id_ = 0;
     UINT timer_interval_ = 250; // 当前定时器间隔（毫秒），用于避免重复 SetTimer
+    UINT dpi_ = 96;             // 窗口所在显示器 DPI
+
+    // 复用的整窗 DIB（UpdateLayeredWindow 源）
+    HDC      mem_dc_    = nullptr;
+    HBITMAP  dib_       = nullptr;
+    HGDIOBJ  old_dib_   = nullptr;
+    void*    dib_bits_  = nullptr;
+    int      dib_w_     = 0;
+    int      dib_h_     = 0;
+
+    // 渲染节流
+    bool      dirty_          = true;
+    bool      hasRendered_    = false;
+    bool      animWasActive_  = false;
+    long long lastRenderedRem_ = 0;
 
     // 缓存的字体（避免每帧创建）
     HFONT fTitle_   = nullptr;
@@ -82,6 +113,7 @@ private:
     long long lastRemSec_ = 0;
     bool contentCacheValid_ = false;
     std::wstring lastContent_;
+    std::wstring lastTargetText_;
 
     HitokotoManager hitokoto_;
 };

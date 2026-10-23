@@ -9,6 +9,7 @@
 #include <set>
 #include <sstream>
 #include <iomanip>
+#include <fstream>
 #include <ctime>
 
 namespace utils {
@@ -89,10 +90,13 @@ std::vector<std::wstring> EnumerateSystemFonts() {
 // ---------------------------------------------------------------------------
 // 剩余时长格式化
 // ---------------------------------------------------------------------------
-std::wstring FormatRemainingTime(long long remaining_seconds, DisplayFormat fmt) {
+std::wstring FormatRemainingTime(long long remaining_seconds, DisplayFormat fmt,
+                                 bool includeStartDay) {
     if (remaining_seconds <= 0) {
         return L"\u5df2\u7ed3\u675f"; // "已结束"
     }
+    // 起始日计入：统一在剩余时间上加一天（已结束状态不追加）
+    if (includeStartDay) remaining_seconds += 86400;
 
     if (fmt == DisplayFormat::HMS) {
         // HH:MM:SS，总小时可超 24（不补齐宽度上限）
@@ -213,6 +217,95 @@ std::wstring GetExeDir() {
     size_t pos = p.find_last_of(L"\\/");
     if (pos == std::wstring::npos) return L".\\";
     return p.substr(0, pos + 1);
+}
+
+// ---------------------------------------------------------------------------
+// 文本文件 / 目录
+// ---------------------------------------------------------------------------
+bool EnsureDirectory(const std::wstring& path) {
+    if (CreateDirectoryW(path.c_str(), nullptr)) return true;
+    return GetLastError() == ERROR_ALREADY_EXISTS;
+}
+
+std::vector<std::wstring> ListTxtFiles(const std::wstring& dir) {
+    std::vector<std::wstring> files;
+    std::wstring pattern = dir;
+    if (!pattern.empty() && pattern.back() != L'\\' && pattern.back() != L'/') {
+        pattern += L'\\';
+    }
+    pattern += L"*.txt";
+
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return files;
+
+    std::wstring base = dir;
+    if (!base.empty() && base.back() != L'\\' && base.back() != L'/') {
+        base += L'\\';
+    }
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        files.push_back(base + fd.cFileName);
+    } while (FindNextFileW(h, &fd));
+
+    FindClose(h);
+    std::sort(files.begin(), files.end());
+    return files;
+}
+
+bool ReadTextFile(const std::wstring& path, std::wstring& out,
+                  size_t maxBytes) {
+    std::ifstream ifs(path.c_str(), std::ios::binary);
+    if (!ifs) return false;
+
+    std::string content;
+    content.resize(maxBytes);
+    std::streamsize got = ifs.read(&content[0],
+        static_cast<std::streamsize>(maxBytes)).gcount();
+    content.resize(static_cast<size_t>(got));
+
+    // 容错 UTF-8 BOM
+    if (content.size() >= 3 &&
+        static_cast<unsigned char>(content[0]) == 0xEF &&
+        static_cast<unsigned char>(content[1]) == 0xBB &&
+        static_cast<unsigned char>(content[2]) == 0xBF) {
+        content.erase(0, 3);
+    }
+    out = Utf8ToWide(content);
+    return true;
+}
+
+bool WriteTextFile(const std::wstring& path, const std::wstring& text) {
+    std::ofstream ofs(path.c_str(), std::ios::binary | std::ios::trunc);
+    if (!ofs) return false;
+    std::string utf8 = WideToUtf8(text);
+    ofs.write(utf8.data(), static_cast<std::streamsize>(utf8.size()));
+    return static_cast<bool>(ofs);
+}
+
+// ---------------------------------------------------------------------------
+// DPI
+// ---------------------------------------------------------------------------
+int GetWindowDpi(HWND hwnd) {
+    // 动态解析 GetDpiForWindow：避免在不支持该 API 的系统上加载失败
+    using GetDpiForWindowFn = UINT(WINAPI*)(HWND);
+    static GetDpiForWindowFn fn = reinterpret_cast<GetDpiForWindowFn>(
+        GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetDpiForWindow"));
+    if (hwnd && fn) {
+        UINT dpi = fn(hwnd);
+        if (dpi != 0) return static_cast<int>(dpi);
+    }
+    HDC dc = GetDC(nullptr);
+    if (dc) {
+        int dpi = GetDeviceCaps(dc, LOGPIXELSX);
+        ReleaseDC(nullptr, dc);
+        if (dpi > 0) return dpi;
+    }
+    return 96;
+}
+
+int ScaleDpi(int value, int dpi) {
+    return MulDiv(value, dpi > 0 ? dpi : 96, 96);
 }
 
 } // namespace utils

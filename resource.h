@@ -40,3 +40,27 @@
 #define IDC_COMBO_ANCHOR           3021
 #define IDC_EDIT_PLACE_X           3022
 #define IDC_EDIT_PLACE_Y           3023
+// 循环 / 起始日 / 自启动
+#define IDC_CHECK_CYCLE            3024
+#define IDC_COMBO_CYCLE            3025
+#define IDC_CHECK_INCLUDE_START    3026
+#define IDC_CHECK_AUTOSTART        3027
+// 一文栏目
+#define IDC_CHECK_ARTICLE          3028
+#define IDC_COMBO_ARTICLE_ANCHOR   3029
+#define IDC_EDIT_ARTICLE_X         3031
+#define IDC_EDIT_ARTICLE_Y         3032
+#define IDC_EDIT_ARTICLE_H         3033
+#define IDC_UD_ARTICLE_H           3034
+#define IDC_EDIT_ARTICLE_M         3035
+#define IDC_UD_ARTICLE_M           3036
+#define IDC_EDIT_ARTICLE_S         3037
+#define IDC_UD_ARTICLE_S           3038
+#define IDC_CHECK_ARTICLE_TOP      3039
+#define IDC_EDIT_ARTICLE_FONT      3040
+#define IDC_UD_ARTICLE_FONT        3041
+#define IDC_COMBO_ARTICLE_SIZE_MODE 3042
+#define IDC_EDIT_ARTICLE_WIDTH     3043
+#define IDC_EDIT_ARTICLE_HEIGHT    3044
+// 设置页标签
+#define IDC_TAB_MAIN               3030

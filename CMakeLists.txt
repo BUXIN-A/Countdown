@@ -11,11 +11,14 @@ set(SOURCES
     src/main.cpp
     src/config.cpp
     src/utils.cpp
+    src/autostart.cpp
     src/countdown_window.cpp
+    src/article_window.cpp
     src/settings_window.cpp
     src/hitokoto.cpp
     src/tray.cpp
     resource.rc
+    app.manifest
 )
 
 add_executable(Countdown WIN32 ${SOURCES})

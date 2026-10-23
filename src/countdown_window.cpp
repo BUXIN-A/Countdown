@@ -12,6 +12,9 @@
 #include <chrono>
 #include <algorithm>
 
+// Explorer 重启后广播的注册消息：收到后需重新添加托盘图标
+static UINT g_taskbarCreatedMsg = 0;
+
 // ---------------------------------------------------------------------------
 // 窗口类注册
 // ---------------------------------------------------------------------------
@@ -34,6 +37,9 @@ bool CountdownWindow::RegisterClass(HINSTANCE hInst) {
 // 创建
 // ---------------------------------------------------------------------------
 bool CountdownWindow::Create(HINSTANCE hInst) {
+    // 一文窗口类（失败不影响倒计时主功能）
+    ArticleWindow::RegisterClass(hInst);
+
     // 置顶/层级由 Reposition 与 WM_WINDOWPOSCHANGING 按配置动态控制：
     // 此处不设 WS_EX_TOPMOST，创建后按 config_.isTop 决定是否置顶。
     DWORD ex_style = WS_EX_LAYERED | WS_EX_TRANSPARENT
@@ -65,8 +71,20 @@ LRESULT CALLBACK CountdownWindow::WndProc(HWND hwnd, UINT msg,
 }
 
 LRESULT CountdownWindow::Handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    // 资源管理器重启后托盘图标会消失，需要重新添加
+    if (g_taskbarCreatedMsg != 0 && msg == g_taskbarCreatedMsg) {
+        tray_.Add(hwnd_, icon_, config_.title);
+        return 0;
+    }
+
     switch (msg) {
         case WM_CREATE:         OnCreate();                       return 0;
+        case WM_DPICHANGED:
+            dpi_ = LOWORD(wp);
+            RebuildFonts();
+            Reposition();
+            article_.Reposition(); // 一文按新 DPI 重新避让
+            return 0;
         case WM_PAINT: {
             // 分层窗口内容由 UpdateLayeredWindow 提供，这里仅验证区域
             PAINTSTRUCT ps;
@@ -114,13 +132,23 @@ void CountdownWindow::OnCreate() {
     icon_ = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(IDI_APPICON),
                               IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
 
+    // DPI 与托盘重建消息（Explorer 重启后重新添加图标）
+    dpi_ = static_cast<UINT>(utils::GetWindowDpi(hwnd_));
+    if (g_taskbarCreatedMsg == 0) {
+        g_taskbarCreatedMsg = RegisterWindowMessageW(L"TaskbarCreated");
+    }
+
     // 加载配置
     config_ = Config::Load();
     RebuildFonts();
     hitokoto_.Init(hwnd_, config_);
 
-    // 定位与尺寸（内部会应用圆角区域）
+    // 一文栏目（独立分层窗口，默认屏幕右侧）
+    article_.Create(hInst, hwnd_);
+
+    // 定位与尺寸（内部会应用圆角区域，并同步一文的避让位置）
     Reposition();
+    article_.ApplyConfig(config_);
 
     // 添加托盘
     tray_.Add(hwnd_, icon_, config_.title);
@@ -133,24 +161,46 @@ void CountdownWindow::OnCreate() {
 }
 
 // ---------------------------------------------------------------------------
-// 字体（缓存在成员中，配置变化时重建）
+// DPI 与字号
+// ---------------------------------------------------------------------------
+int CountdownWindow::S(int value) const {
+    return utils::ScaleDpi(value, static_cast<int>(dpi_));
+}
+
+int CountdownWindow::TitleFontPx() const {
+    return S(std::max(12, config_.fontSize * 4 / 9));
+}
+
+int CountdownWindow::ContentFontPx() const {
+    return S(config_.fontSize);
+}
+
+int CountdownWindow::TargetFontPx() const {
+    return S(12);
+}
+
+int CountdownWindow::HkBaseFontPx() const {
+    return S(std::max(11, config_.fontSize / 2));
+}
+
+// ---------------------------------------------------------------------------
+// 字体（缓存在成员中，配置/DPI 变化时重建）
 // ---------------------------------------------------------------------------
 void CountdownWindow::RebuildFonts() {
     DestroyFonts();
     const wchar_t* family = config_.font.empty()
         ? L"Segoe UI" : config_.font.c_str();
-    int titleSize = std::max(12, config_.fontSize * 4 / 9);
 
-    fTitle_ = CreateFontW(titleSize, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+    fTitle_ = CreateFontW(-TitleFontPx(), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                           DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                           CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                           DEFAULT_PITCH | FF_DONTCARE, family);
-    fContent_ = CreateFontW(config_.fontSize, 0, 0, 0, FW_BOLD,
+    fContent_ = CreateFontW(-ContentFontPx(), 0, 0, 0, FW_BOLD,
                             FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                             OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                             CLEARTYPE_QUALITY,
                             DEFAULT_PITCH | FF_DONTCARE, family);
-    fTarget_ = CreateFontW(12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+    fTarget_ = CreateFontW(-TargetFontPx(), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                            CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                            DEFAULT_PITCH | FF_DONTCARE, family);
@@ -163,7 +213,9 @@ void CountdownWindow::DestroyFonts() {
     if (fHk_)      { DeleteObject(fHk_);      fHk_ = nullptr; }
     fHkSize_ = 0;
     lastHkText_.clear();
+    lastTargetText_.clear();
     contentCacheValid_ = false; // 字体变化，倒计时文本缓存一并失效
+    dirty_ = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -183,29 +235,53 @@ void CountdownWindow::ApplyRoundedRegion() {
 // ---------------------------------------------------------------------------
 // 重定位：按锚点模板 + 偏移在工作区内定位，并按 isTop 决定是否置顶
 // ---------------------------------------------------------------------------
+static int MeasureTextWidth(HFONT font, const std::wstring& text) {
+    if (!font || text.empty()) return 0;
+    HDC dc = GetDC(nullptr);
+    if (!dc) return 0;
+    HFONT old = (HFONT)SelectObject(dc, font);
+    SIZE sz{};
+    GetTextExtentPoint32W(dc, text.c_str(), static_cast<int>(text.size()), &sz);
+    SelectObject(dc, old);
+    ReleaseDC(nullptr, dc);
+    return sz.cx;
+}
+
 void CountdownWindow::Reposition() {
+    // 以窗口当前所在显示器为准（Per-Monitor DPI：跨屏后按新 DPI 缩放）
+    dpi_ = static_cast<UINT>(utils::GetWindowDpi(hwnd_));
+
     RECT work{};
-    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    HMONITOR mon = MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    if (mon && GetMonitorInfoW(mon, &mi)) {
+        work = mi.rcWork;
+    } else {
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    }
     int work_w = work.right - work.left;
     int work_h = work.bottom - work.top;
 
-    // 窗口宽度按当前显示文本估算，保证内容完整显示
-    // （Full 格式带"年月日时分秒"单位，文本较长，需加宽窗口）
+    // 窗口宽度按实际文本像素宽度计算，避免中文单位被裁切
+    long long rem = ComputeRemainingSeconds();
     std::wstring content = utils::FormatRemainingTime(
-        ComputeRemainingSeconds(), config_.displayFormat);
-    // 数字约 0.6em、中文/全角约 1em，按 0.8em 平均估算像素宽度
-    int w = static_cast<int>(config_.fontSize * 0.8
-                * static_cast<int>(content.size())) + 90;
-    w = std::max(w, 560);
-    // 工作区过窄（< 34px）时不再收缩，避免 work_w-16 为负导致窗口反向溢出
-    if (work_w > 34) w = std::min(w, work_w - 16);
+        rem, config_.displayFormat, config_.includeStartDay);
+    std::wstring target = L"\u76ee\u6807\uff1a"
+                        + utils::FormatTargetTime(config_.EffectiveTargetTime());
+
+    int textW = MeasureTextWidth(fContent_, content);
+    textW = std::max(textW, MeasureTextWidth(fTitle_, config_.title));
+    textW = std::max(textW, MeasureTextWidth(fTarget_, target));
+    int w = textW + S(60);
+    w = std::max(w, S(560));
+    // 工作区过窄时不再收缩，避免 work_w-16 为负导致窗口反向溢出
+    if (work_w > S(34)) w = std::min(w, work_w - S(16));
 
     // 窗口高度：标题 + 倒计时大字 + 目标时间 + 一言区域（最多 2 行）
-    int titleSize = std::max(12, config_.fontSize * 4 / 9);
-    int hkBase = std::max(11, config_.fontSize / 2);
-    int h = 6 + titleSize + 4 + config_.fontSize + 4 + 16 + 2
-            + (2 * hkBase + 6) + 4;
-    h = std::max(h, 80);
+    int h = S(6) + (TitleFontPx() + S(4)) + (ContentFontPx() + S(4))
+            + S(16) + S(2) + (2 * HkBaseFontPx() + S(6)) + S(4);
+    h = std::max(h, S(80));
 
     // 锚点模板：按水平/垂直分量分别取基准位置，再叠加用户偏移
     int x, y;
@@ -252,8 +328,8 @@ void CountdownWindow::Reposition() {
 // 剩余秒数计算
 // ---------------------------------------------------------------------------
 long long CountdownWindow::ComputeRemainingSeconds() const {
-    // config 中存储的是本地时间字符串，使用 mktime 解析为本地 time_t
-    std::tm local = config_.targetTime;
+    // 循环开启时使用顺延后的生效目标；config 存储的是本地时间
+    std::tm local = config_.EffectiveTargetTime();
     local.tm_isdst = -1; // 让运行时决定 DST
     std::time_t target = std::mktime(&local);
 
@@ -262,6 +338,7 @@ long long CountdownWindow::ComputeRemainingSeconds() const {
 }
 
 void CountdownWindow::RequestRedraw() {
+    dirty_ = true;
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
@@ -283,11 +360,10 @@ void DrawTextCentered(HDC dc, const std::wstring& text,
 
 // 一言区域（窗口客户区坐标）：目标时间下方，高度最多 2 行
 RECT CountdownWindow::HitokotoRect(int w, int h) const {
-    int titleSize = std::max(12, config_.fontSize * 4 / 9);
-    int hkBase = std::max(11, config_.fontSize / 2);
-    int top = 6 + (titleSize + 4) + (config_.fontSize + 4) + 16 + 2;
-    int bottom = std::min(h - 4, top + 2 * hkBase + 6);
-    return {8, top, w - 8, bottom};
+    int top = S(6) + (TitleFontPx() + S(4)) + (ContentFontPx() + S(4))
+              + S(16) + S(2);
+    int bottom = std::min(h - S(4), top + 2 * HkBaseFontPx() + S(6));
+    return {S(8), top, w - S(8), bottom};
 }
 
 // 一言文本：字号随内容缩放，确保在区域内最多 2 行。
@@ -307,8 +383,8 @@ void CountdownWindow::DrawHitokoto(HDC mem, int w, int h,
     const wchar_t* family = config_.font.empty()
         ? L"Segoe UI" : config_.font.c_str();
 
-    // 测量：字号 sz 的字体能否在区域内两行内放下
-    auto fits = [&](int sz, HFONT font) -> bool {
+    // 测量：该字体能否在区域内两行内放下
+    auto fits = [&](HFONT font) -> bool {
         HFONT old = (HFONT)SelectObject(mem, font);
         RECT rc = {0, 0, availW, 0};
         DrawTextW(mem, hk.c_str(), -1, &rc,
@@ -324,12 +400,13 @@ void CountdownWindow::DrawHitokoto(HDC mem, int w, int h,
         // 文本变化：从基准字号向下试探，选择能放下的最大字号并缓存
         int size = std::max(11, config_.fontSize / 2);
         while (size >= 10) {
-            HFONT tmp = CreateFontW(size, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            // 使用灰度抗锯齿：文本层像素与文本色成线性关系，便于还原 alpha
+            HFONT tmp = CreateFontW(-S(size), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                                     DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                                    CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                                    CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
                                     DEFAULT_PITCH | FF_DONTCARE, family);
             if (!tmp) break;
-            if (fits(size, tmp)) {
+            if (fits(tmp)) {
                 if (fHk_) DeleteObject(fHk_);
                 fHk_ = tmp;
                 fHkSize_ = size;
@@ -355,6 +432,15 @@ void CountdownWindow::DrawHitokoto(HDC mem, int w, int h,
         DrawTextW(mem, hk.c_str(), -1, &rc,
                   DT_CENTER | DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL);
         SelectObject(mem, old);
+        // GDI 绘制可能清掉目标像素的 alpha 字节，这里恢复该区域为不透明
+        int yEnd = std::min<int>(static_cast<int>(area.bottom), h);
+        int xEnd = std::min<int>(static_cast<int>(area.right), w);
+        for (int yy = std::max<int>(0, static_cast<int>(area.top)); yy < yEnd; ++yy) {
+            DWORD* row = reinterpret_cast<DWORD*>(base + (size_t)yy * stride);
+            for (int xx = std::max<int>(0, static_cast<int>(area.left)); xx < xEnd; ++xx) {
+                row[xx] |= 0xFF000000u;
+            }
+        }
         return;
     }
 
@@ -379,14 +465,15 @@ void CountdownWindow::DrawHitokoto(HDC mem, int w, int h,
     HBITMAP oldT = (HBITMAP)SelectObject(tdc, tex);
     HFONT oldF = (HFONT)SelectObject(tdc, f);
     SetBkMode(tdc, TRANSPARENT);
-    SetTextColor(tdc, RGB(tR, tG, tB));
+    // 文本层画白色：灰度 AA 下像素值即覆盖度，无需再按文本色通道换算
+    SetTextColor(tdc, RGB(255, 255, 255));
     RECT trc = {0, 0, availW, maxH};
     DrawTextW(tdc, hk.c_str(), -1, &trc,
               DT_CENTER | DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL);
     SelectObject(tdc, oldF);
 
-    // 文本层像素为"黑底 + 文本色线性插值"，按通道归一可还原覆盖度：
-    //   a[c] = 像素分量 * fade / 文本色分量 ∈ [0, fade]
+    // 文本层为"黑底 + 白色文字"，像素亮度即覆盖度 cov：
+    //   a = cov * fade / 255
     //   合成 = 背景 * (1 - a/255) + 文本色 * a/255；alpha 恒 255（背景不透明）
     int tStride = availW * 4;
     for (int y = 0; y < maxH; ++y) {
@@ -395,15 +482,13 @@ void CountdownWindow::DrawHitokoto(HDC mem, int w, int h,
         const BYTE* tp = static_cast<const BYTE*>(tbits) + (size_t)y * tStride;
         BYTE* q = base + (size_t)ay * stride + (size_t)area.left * 4;
         for (int x = 0; x < availW; ++x, tp += 4, q += 4) {
-            int aB = (tp[0] * fade) / tB;
-            int aG = (tp[1] * fade) / tG;
-            int aR = (tp[2] * fade) / tR;
-            if (aR > 255) aR = 255;
-            if (aG > 255) aG = 255;
-            if (aB > 255) aB = 255;
-            if (aB) q[0] = (BYTE)((q[0] * (255 - aB) + tB * aB) / 255);
-            if (aG) q[1] = (BYTE)((q[1] * (255 - aG) + tG * aG) / 255);
-            if (aR) q[2] = (BYTE)((q[2] * (255 - aR) + tR * aR) / 255);
+            int cov = tp[0]; // 灰度 AA：R=G=B
+            int a = cov * fade / 255;
+            if (a) {
+                q[0] = (BYTE)((q[0] * (255 - a) + tB * a) / 255);
+                q[1] = (BYTE)((q[1] * (255 - a) + tG * a) / 255);
+                q[2] = (BYTE)((q[2] * (255 - a) + tR * a) / 255);
+            }
             q[3] = 255; // 背景恒定不透明
         }
     }
@@ -413,14 +498,25 @@ void CountdownWindow::DrawHitokoto(HDC mem, int w, int h,
     DeleteDC(tdc);
 }
 
-// 整窗重绘：32 位 DIB + UpdateLayeredWindow，
-// 背景/标题/倒计时/目标时间不透明，一言区域 alpha 随动画渐变
-void CountdownWindow::Render() {
-    RECT wr;
-    GetWindowRect(hwnd_, &wr);
-    int w = wr.right - wr.left;
-    int h = wr.bottom - wr.top;
-    if (w <= 0 || h <= 0) return;
+// ---------------------------------------------------------------------------
+// 整窗 DIB：尺寸不变时复用，避免每次重绘都 CreateDIBSection
+// ---------------------------------------------------------------------------
+bool CountdownWindow::EnsureDib(int w, int h) {
+    if (dib_ && dib_w_ == w && dib_h_ == h) return true;
+
+    if (!mem_dc_) {
+        HDC screen = GetDC(nullptr);
+        mem_dc_ = CreateCompatibleDC(screen);
+        ReleaseDC(nullptr, screen);
+        if (!mem_dc_) return false;
+    }
+    if (dib_) {
+        SelectObject(mem_dc_, old_dib_);
+        DeleteObject(dib_);
+        dib_ = nullptr;
+        dib_bits_ = nullptr;
+        old_dib_ = nullptr;
+    }
 
     BITMAPINFO bi{};
     bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -432,12 +528,46 @@ void CountdownWindow::Render() {
 
     void* bits = nullptr;
     HDC screen = GetDC(nullptr);
-    HDC mem = CreateCompatibleDC(screen);
-    HBITMAP dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS,
-                                   &bits, nullptr, 0);
+    HBITMAP dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
     ReleaseDC(nullptr, screen);
-    if (!dib) { DeleteDC(mem); return; }
-    HBITMAP oldBmp = (HBITMAP)SelectObject(mem, dib);
+    if (!dib) return false;
+
+    old_dib_  = SelectObject(mem_dc_, dib);
+    dib_      = dib;
+    dib_bits_ = bits;
+    dib_w_    = w;
+    dib_h_    = h;
+    return true;
+}
+
+void CountdownWindow::ReleaseDib() {
+    if (mem_dc_) {
+        if (dib_) {
+            SelectObject(mem_dc_, old_dib_);
+            DeleteObject(dib_);
+        }
+        DeleteDC(mem_dc_);
+    }
+    mem_dc_   = nullptr;
+    dib_      = nullptr;
+    old_dib_  = nullptr;
+    dib_bits_ = nullptr;
+    dib_w_    = 0;
+    dib_h_    = 0;
+}
+
+// 整窗重绘：32 位 DIB + UpdateLayeredWindow，
+// 背景/标题/倒计时/目标时间不透明，一言区域 alpha 随动画渐变
+void CountdownWindow::Render() {
+    RECT wr;
+    GetWindowRect(hwnd_, &wr);
+    int w = wr.right - wr.left;
+    int h = wr.bottom - wr.top;
+    if (w <= 0 || h <= 0) return;
+    if (!EnsureDib(w, h)) return;
+
+    HDC mem = mem_dc_;
+    BYTE* base = static_cast<BYTE*>(dib_bits_);
 
     // 背景渐变（顶深底更深）
     TRIVERTEX verts[2] = {};
@@ -467,19 +597,20 @@ void CountdownWindow::Render() {
     // 同一秒内多次重绘（一言动画期间 30ms/帧）不重复做逐月循环的时间换算
     if (!contentCacheValid_ || rem != lastRemSec_) {
         lastRemSec_ = rem;
-        lastContent_ = utils::FormatRemainingTime(rem, config_.displayFormat);
+        lastContent_ = utils::FormatRemainingTime(
+            rem, config_.displayFormat, config_.includeStartDay);
+        lastTargetText_ = L"\u76ee\u6807\uff1a"
+                        + utils::FormatTargetTime(config_.EffectiveTargetTime());
         contentCacheValid_ = true;
     }
     std::wstring content = lastContent_;
-    std::wstring target = L"\u76ee\u6807\uff1a"
-                        + utils::FormatTargetTime(config_.targetTime);
+    std::wstring target  = lastTargetText_;
 
-    // 布局：标题 / 大字 / 目标时间 / 一言
-    int titleSize = std::max(12, config_.fontSize * 4 / 9);
-    int titleTop = 6;
-    int titleH   = titleSize + 4;
-    int contentH = config_.fontSize + 4;
-    int targetH  = 16;
+    // 布局：标题 / 大字 / 目标时间 / 一言（全部按 DPI 缩放）
+    int titleTop = S(6);
+    int titleH   = TitleFontPx() + S(4);
+    int contentH = ContentFontPx() + S(4);
+    int targetH  = S(16);
     RECT rcTitle   = {0, titleTop, w, titleTop + titleH};
     RECT rcContent = {0, titleTop + titleH, w, titleTop + titleH + contentH};
     RECT rcTarget  = {0, titleTop + titleH + contentH, w,
@@ -492,7 +623,6 @@ void CountdownWindow::Render() {
     // ---- 每像素 alpha：背景与主内容全部不透明 ----
     // 按 4 字节一次位或设置 alpha=255（保留 RGB），比逐字节循环更快
     int stride = w * 4;
-    BYTE* base = static_cast<BYTE*>(bits);
     DWORD* px = reinterpret_cast<DWORD*>(base);
     for (int i = 0, n = w * h; i < n; ++i) px[i] |= 0xFF000000u;
     // 一言文本：经独立文本层合成，渐隐渐显只作用于文字，背景恒定不透明
@@ -507,9 +637,9 @@ void CountdownWindow::Render() {
     bf.AlphaFormat = AC_SRC_ALPHA;
     UpdateLayeredWindow(hwnd_, nullptr, &pt, &sz, mem, &zero, 0, &bf, ULW_ALPHA);
 
-    SelectObject(mem, oldBmp);
-    DeleteObject(dib);
-    DeleteDC(mem);
+    lastRenderedRem_ = rem;
+    hasRendered_ = true;
+    dirty_ = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -517,6 +647,7 @@ void CountdownWindow::Render() {
 // ---------------------------------------------------------------------------
 void CountdownWindow::OnTimer() {
     hitokoto_.Tick();
+    article_.Tick();
 
     // 一言切换动画期间提高刷新率（30ms），常态 250ms；
     // 间隔未变化时不再重复 SetTimer（每帧调用纯属冗余）
@@ -526,14 +657,26 @@ void CountdownWindow::OnTimer() {
         SetTimer(hwnd_, 1, timer_interval_, nullptr);
     }
 
-    Render();
+    // 仅在秒变化、动画进行中或界面变脏时重绘：
+    // 静态倒计时每秒一次 UpdateLayeredWindow，而不是每 250ms 一次
+    long long rem = ComputeRemainingSeconds();
+    bool animating = hitokoto_.IsAnimating();
+    if (animating) animWasActive_ = true;
+    bool needRender = dirty_ || !hasRendered_
+                      || rem != lastRenderedRem_ || animating || animWasActive_;
+    if (needRender) {
+        Render();
+        animWasActive_ = hitokoto_.IsAnimating();
+    }
 }
 
 void CountdownWindow::OnDestroy() {
     if (timer_id_) KillTimer(hwnd_, timer_id_);
+    article_.Destroy();
     tray_.Remove();
     if (icon_) DestroyIcon(icon_);
     DestroyFonts();
+    ReleaseDib();
 }
 
 // ---------------------------------------------------------------------------
@@ -545,6 +688,7 @@ void CountdownWindow::ApplyConfig(const Config& cfg) {
     hitokoto_.ApplyConfig(cfg);
     tray_.SetTooltip(cfg.title);
     Reposition(); // 字号/一言区域可能变化，需重新布局
+    article_.ApplyConfig(cfg); // 一文开关/位置/刷新配置
 }
 
 // ---------------------------------------------------------------------------
