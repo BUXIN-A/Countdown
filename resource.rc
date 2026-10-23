@@ -1,0 +1,4 @@
+// 资源文件：嵌入应用图标
+#include "resource.h"
+
+IDI_APPICON ICON "countdown.ico"
