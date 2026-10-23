@@ -149,6 +149,9 @@ Config Config::Defaults() {
     c.displayFormat = utils::DisplayFormat::HMS;
     c.fontSize = 36;
     c.font = utils::GetSystemDefaultFontName();
+    // 默认按年循环：目标日固定在 2000-06-07，作为周年纪念日倒计时，
+    // 否则默认目标早已过去，首次启动会一直显示“已结束”
+    c.cycle = CycleUnit::Year;
 
     // 默认目标时间：2000-06-07 00:00:00
     std::tm target{};

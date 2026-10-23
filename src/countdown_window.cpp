@@ -724,5 +724,8 @@ void CountdownWindow::OpenSettings() {
 // 退出
 // ---------------------------------------------------------------------------
 void CountdownWindow::Quit() {
+    // 设置窗口是模态的（自带消息循环）：若它开着，必须先关闭，
+    // 否则该循环会先消费掉 WM_QUIT 再退出，主消息循环永远收不到退出消息
+    CloseSettingsWindow();
     if (hwnd_) DestroyWindow(hwnd_);
 }

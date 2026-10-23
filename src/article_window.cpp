@@ -24,6 +24,11 @@ static const wchar_t* kDefaultArticleText = LR"(《破土》
 遇到难题，别急着否定自己，先把它拆小；遇到失败，别只顾沮丧，先记录原因。别等状态好了才行动，很多时候，是行动带来了状态。
 和昨天的自己比，不和别人的高光比。把目标写下来，把任务做到底。你现在的坚持，也许暂时看不见结果，但会在某一天连成台阶，托你走向更高的地方。慢一点没关系，别停就好。)";
 
+// 正文内边距（96 DPI 逻辑像素）：布局测量与绘制必须共用同一组值，
+// 否则会出现“按 22 算高度、按 20 裁切”，最后一行被切掉
+static const int kArticlePadX = 22;
+static const int kArticlePadY = 20;
+
 static void TrimWhitespace(std::wstring& s) {
     size_t begin = 0;
     while (begin < s.size() && std::iswspace(s[begin])) ++begin;
@@ -122,7 +127,14 @@ LRESULT ArticleWindow::Handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             dpi_ = LOWORD(wp);
             Reposition();
             return 0;
+        case WM_TIMER:
+            if (wp == kAnimTimerId) {
+                StepAnimation();
+                return 0;
+            }
+            return DefWindowProcW(hwnd, msg, wp, lp);
         case WM_DESTROY:
+            StopAnimation();
             ReleaseDib();
             return 0;
         default:
@@ -138,6 +150,7 @@ void ArticleWindow::ApplyConfig(const Config& cfg) {
     if (!hwnd_) return;
 
     if (!cfg_.articleEnabled) {
+        StopAnimation();
         ShowWindow(hwnd_, SW_HIDE);
         return;
     }
@@ -147,6 +160,7 @@ void ArticleWindow::ApplyConfig(const Config& cfg) {
     index_ = prevIndex < articles_.size() ? prevIndex : 0;
     lastSwitch_ = GetTickCount();
     if (articles_.empty()) {
+        StopAnimation();
         ShowWindow(hwnd_, SW_HIDE);
         return;
     }
@@ -203,6 +217,7 @@ int ArticleWindow::S(int value) const {
 void ArticleWindow::Reposition() {
     if (!hwnd_) return;
     if (!cfg_.articleEnabled || articles_.empty()) {
+        StopAnimation();
         ShowWindow(hwnd_, SW_HIDE);
         return;
     }
@@ -223,7 +238,8 @@ void ArticleWindow::Reposition() {
     int workW = work.right - work.left;
     int workH = work.bottom - work.top;
 
-    int pad = S(22);
+    int padX = S(kArticlePadX);
+    int padY = S(kArticlePadY);
     const std::wstring& text = articles_[index_];
     const wchar_t* family = cfg_.font.empty()
         ? L"Segoe UI" : cfg_.font.c_str();
@@ -264,7 +280,7 @@ void ArticleWindow::Reposition() {
                 DeleteObject(f);
             }
         }
-        w = maxLineW + 2 * pad;
+        w = maxLineW + 2 * padX;
         w = std::max(w, S(220));
         w = std::min(w, std::min(S(600), workW - S(24)));
     } else {
@@ -272,12 +288,12 @@ void ArticleWindow::Reposition() {
         w = std::min(w, workW - S(24));
     }
 
-    int innerW = w - 2 * pad;
+    int innerW = w - 2 * padX;
     bool custom = cfg_.articleSizeMode == ArticleSizeMode::Custom;
     int targetH = std::min(S(std::max(120, std::min(2000, cfg_.articleHeight))),
                            workH - S(24));
-    int maxInnerH = custom ? (targetH - 2 * pad)
-                           : (workH - S(24) - 2 * pad);
+    int maxInnerH = custom ? (targetH - 2 * padY)
+                           : (workH - S(24) - 2 * padY);
     if (innerW < S(80) || maxInnerH < S(40)) {
         if (dc) ReleaseDC(nullptr, dc);
         ShowWindow(hwnd_, SW_HIDE);
@@ -313,7 +329,7 @@ void ArticleWindow::Reposition() {
     if (custom) {
         h = targetH;
     } else {
-        h = bestH + 2 * pad;
+        h = bestH + 2 * padY;
         h = std::min(h, workH - S(24));
         h = std::max(h, S(160));
     }
@@ -381,10 +397,101 @@ void ArticleWindow::Reposition() {
         }
     }
 
-    SetWindowPos(hwnd_, cfg_.articleIsTop ? HWND_TOPMOST : HWND_NOTOPMOST,
-                 x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    // 已显示时做尺寸/位置过渡；首次显示直接落位
+    bool animate = IsWindowVisible(hwnd_) != FALSE;
+    ApplyTargetRect(x, y, w, h, cfg_.articleIsTop, animate);
+}
+
+// ---------------------------------------------------------------------------
+// 尺寸/位置过渡动画
+// ---------------------------------------------------------------------------
+void ArticleWindow::StopAnimation() {
+    if (animating_) {
+        animating_ = false;
+        KillTimer(hwnd_, kAnimTimerId);
+    }
+}
+
+void ArticleWindow::ApplyTargetRect(int x, int y, int w, int h,
+                                    bool topmost, bool animate) {
+    if (!hwnd_) return;
+
+    RECT cur{};
+    GetWindowRect(hwnd_, &cur);
+    int cw = cur.right - cur.left;
+    int ch = cur.bottom - cur.top;
+
+    if (!animate || cw <= 0 || ch <= 0) {
+        StopAnimation();
+        SetWindowPos(hwnd_, topmost ? HWND_TOPMOST : HWND_NOTOPMOST,
+                     x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        ApplyRoundedRegion();
+        Render();
+        return;
+    }
+
+    if (cur.left == x && cur.top == y && cw == w && ch == h) {
+        // 尺寸未变：仅确保显示与层级
+        SetWindowPos(hwnd_, topmost ? HWND_TOPMOST : HWND_NOTOPMOST,
+                     0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        ApplyRoundedRegion();
+        Render();
+        return;
+    }
+
+    animFrom_ = cur;
+    animTo_ = RECT{x, y, x + w, y + h};
+    animTopmost_ = topmost;
+    animStart_ = GetTickCount();
+    if (!animating_) {
+        animating_ = true;
+        SetTimer(hwnd_, kAnimTimerId, 16, nullptr);
+    }
+}
+
+void ArticleWindow::StepAnimation() {
+    if (!animating_) {
+        KillTimer(hwnd_, kAnimTimerId);
+        return;
+    }
+
+    DWORD elapsed = GetTickCount() - animStart_;
+    float t = static_cast<float>(elapsed) / 180.0f; // 180ms 过渡
+    bool done = false;
+    if (t >= 1.0f) {
+        t = 1.0f;
+        done = true;
+    }
+    // ease-out cubic
+    float e = 1.0f - (1.0f - t) * (1.0f - t) * (1.0f - t);
+    auto lerp = [e](int a, int b) {
+        return a + static_cast<int>((b - a) * e);
+    };
+
+    int fw = animFrom_.right - animFrom_.left;
+    int fh = animFrom_.bottom - animFrom_.top;
+    int tw = animTo_.right - animTo_.left;
+    int th = animTo_.bottom - animTo_.top;
+    int x = lerp(animFrom_.left, animTo_.left);
+    int y = lerp(animFrom_.top, animTo_.top);
+    int w = lerp(fw, tw);
+    int h = lerp(fh, th);
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+
+    SetWindowPos(hwnd_, nullptr, x, y, w, h,
+                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     ApplyRoundedRegion();
     Render();
+
+    if (done) {
+        animating_ = false;
+        KillTimer(hwnd_, kAnimTimerId);
+        SetWindowPos(hwnd_, animTopmost_ ? HWND_TOPMOST : HWND_NOTOPMOST,
+                     0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
 }
 
 void ArticleWindow::ApplyRoundedRegion() {
@@ -501,7 +608,8 @@ void ArticleWindow::Render() {
         HFONT old = (HFONT)SelectObject(mem, f);
         SetBkMode(mem, TRANSPARENT);
         SetTextColor(mem, RGB(228, 226, 236));
-        RECT rc = {S(22), S(20), w - S(22), h - S(20)};
+        RECT rc = {S(kArticlePadX), S(kArticlePadY),
+                   w - S(kArticlePadX), h - S(kArticlePadY)};
         DrawTextW(mem, articles_[index_].c_str(), -1, &rc,
                   DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX
                   | DT_EXPANDTABS | DT_EDITCONTROL);

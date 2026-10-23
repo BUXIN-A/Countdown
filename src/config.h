@@ -42,7 +42,7 @@ struct Config {
     std::wstring title;             // 倒计时标题
     std::tm      targetTime{};      // 目标时间
     utils::DisplayFormat displayFormat = utils::DisplayFormat::HMS;
-    int          fontSize = 48;    // 字号（96 DPI 下的逻辑像素）
+    int          fontSize = 36;    // 字号（96 DPI 下的逻辑像素）
     std::wstring font;             // 字体名
     bool         includeStartDay = false; // 起始日是否计入倒计时（时间 +1 天）
     CycleUnit    cycle = CycleUnit::None; // 循环单位（None=不循环）
@@ -68,7 +68,7 @@ struct Config {
     int          placeY   = 0;       // 相对模板位置的垂直偏移（像素，可为负）
     bool         autoStart = false;  // 是否开机自启动（HKCU Run）
 
-    // 返回默认配置（目标 = 当前时间 + 7 天）
+    // 返回默认配置（目标 = 2000-06-07，按年循环作为周年倒计时）
     static Config Defaults();
 
     // 从 exe 同目录 config.json 加载；失败则写入默认配置

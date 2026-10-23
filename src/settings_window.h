@@ -10,3 +10,7 @@
 
 // 打开模态设置窗口；返回 true 表示用户已保存（cfg 已更新）。
 bool OpenSettingsDialog(HWND parent, Config& cfg);
+
+// 关闭当前打开的设置窗口（若有）。退出流程必须先调用它，否则模态消息循环
+// 会吞掉 WM_QUIT，导致进程无法正常退出。
+void CloseSettingsWindow();

@@ -14,6 +14,8 @@
 #define WM_APP_OPEN_SETTINGS (WM_APP + 3)
 // 网络一言获取完成（后台线程通过 PostMessage 通知主窗口，lParam 指向 new std::wstring）
 #define WM_APP_HITOKOTO (WM_APP + 4)
+// 关闭月历浮层（从月历通知中返回后再销毁，避免在控件自身通知里销毁控件）
+#define WM_APP_CLOSE_CALENDAR (WM_APP + 6)
 
 // 托盘右键菜单命令
 #define IDM_TRAY_SETTINGS 2001
@@ -59,8 +61,19 @@
 #define IDC_CHECK_ARTICLE_TOP      3039
 #define IDC_EDIT_ARTICLE_FONT      3040
 #define IDC_UD_ARTICLE_FONT        3041
+// 一文尺寸
 #define IDC_COMBO_ARTICLE_SIZE_MODE 3042
 #define IDC_EDIT_ARTICLE_WIDTH     3043
 #define IDC_EDIT_ARTICLE_HEIGHT    3044
+// 日期胶囊右侧的日历按钮与其弹出的月历
+#define IDC_BTN_CALENDAR           3045
+#define IDC_CAL_POPUP              3046
+// 月历上方的年份切换按钮
+#define IDC_CAL_PREV_YEAR          3050
+#define IDC_CAL_NEXT_YEAR          3051
+// 数字步进器与下拉浮层
+#define IDC_BTN_STEP_MINUS         3047
+#define IDC_BTN_STEP_PLUS          3048
+#define IDC_DROPDOWN_LIST          3049
 // 设置页标签
 #define IDC_TAB_MAIN               3030

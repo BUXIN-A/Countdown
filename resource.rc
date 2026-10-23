@@ -2,3 +2,9 @@
 #include "resource.h"
 
 IDI_APPICON ICON "countdown.ico"
+
+#ifdef COUNTDOWN_EMBED_MANIFEST
+// MinGW 不会自动嵌入 .manifest，这里作为 RT_MANIFEST（ID=1）资源编译进 exe。
+// MSVC 由链接器合并 app.manifest，故不定义该宏，避免重复清单资源。
+1 24 "app.manifest"
+#endif

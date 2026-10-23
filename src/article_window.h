@@ -42,6 +42,19 @@ private:
     void ApplyRoundedRegion();
     void Render();
 
+    // 尺寸/位置切换动画（切换文章或改尺寸时平滑过渡）
+    void ApplyTargetRect(int x, int y, int w, int h, bool topmost, bool animate);
+    void StepAnimation();
+    void StopAnimation();
+
+    static const UINT_PTR kAnimTimerId = 1;
+
+    bool  animating_ = false;
+    DWORD animStart_ = 0;
+    RECT  animFrom_{};
+    RECT  animTo_{};
+    bool  animTopmost_ = false;
+
     bool EnsureDib(int w, int h);
     void ReleaseDib();
 

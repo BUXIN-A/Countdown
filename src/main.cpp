@@ -7,15 +7,6 @@
 #include "countdown_window.h"
 #include "resource.h"
 
-// 启用 Common Controls v6 视觉样式（让按钮/组合框等呈现现代外观）
-#pragma comment(linker, \
-"\"/manifestdependency:type='win32' \
-name='Microsoft.Windows.Common-Controls' \
-version='6.0.0.0' \
-processorArchitecture='*' \
-publicKeyToken='6595b64144ccf1df' \
-language='*'\"")
-
 // 单实例互斥体名称（会话级：同一登录会话内保证唯一）
 static const wchar_t kSingleInstanceMutex[] = L"Local\\Countdown_SingleInstance_Mutex";
 

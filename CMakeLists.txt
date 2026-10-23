@@ -36,6 +36,13 @@ if(MSVC)
     # 让 rc.exe 能找到 resource.h 与 countdown.ico
     set_source_files_properties(resource.rc PROPERTIES
         COMPILE_FLAGS "/I \"${CMAKE_CURRENT_SOURCE_DIR}\"")
+elseif(MINGW)
+    # 入口是 wWinMain：MinGW 必须加 -municode，否则链接报 undefined WinMain
+    # -static 把 libstdc++/libgcc/winpthread 静态链入，保持单 exe 分发
+    target_link_options(Countdown PRIVATE -municode -static)
+    # MinGW 不会像 MSVC 那样自动把 .manifest 合并进 exe，
+    # 由 resource.rc 按该宏把清单编译成 RT_MANIFEST 资源
+    target_compile_definitions(Countdown PRIVATE COUNTDOWN_EMBED_MANIFEST)
 endif()
 
 target_link_libraries(Countdown PRIVATE
@@ -46,6 +53,7 @@ target_link_libraries(Countdown PRIVATE
     comdlg32
     dwmapi
     shell32
+    uxtheme
     winhttp
 )
 

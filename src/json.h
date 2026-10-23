@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <cstdlib>
+#include <cmath>
 #include <cwctype>
 
 namespace mini_json {

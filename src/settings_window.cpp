@@ -1,8 +1,12 @@
 // =============================================================================
-// settings_window.cpp - 设置窗口实现
+// settings_window.cpp - 深色无边框设置窗口
 //
-// 自定义窗口 + 四标签页（基本 / 外观 / 一言 / 窗口与启动）。
-// 保存后写回 config.json；返回 true 时调用方应用新配置。
+// 视觉参考：深色背景、胶囊标签页、右侧值胶囊、细分隔线、圆角无边框窗口。
+// 交互：
+//  - 枚举值（循环/格式/来源/位置/尺寸模式/字体）使用自绘深色下拉列表；
+//  - 布尔值显示为“开/关”胶囊；
+//  - 日期为文本胶囊 + 日历月历浮层；时间为文本胶囊；
+//  - 数字字段使用 左“−” / 中间数值 / 右“+” 的自绘步进器。
 // =============================================================================
 #include "settings_window.h"
 #include "../resource.h"
@@ -12,20 +16,49 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <commctrl.h>
+#include <uxtheme.h>
+#include <algorithm>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
+#include <cwchar>
+#include <initializer_list>
+#include <new>
 #include <string>
+#include <utility>
 #include <vector>
 
-// 布局常量（96 DPI 下的逻辑尺寸，运行时按 DPI 缩放）
-static const int kPadding = 18;
-static const int kLabelW  = 92;
-static const int kRowH    = 26;
-static const int kRowGap  = 12;
-static const int kWinW    = 560;
-static const int kWinH    = 500;
-static const int kTabH    = 400;
-static const int kTabCount = 5;
+// ---------------------------------------------------------------------------
+// 配色（深色卡片风格）
+// ---------------------------------------------------------------------------
+static const COLORREF kBg         = RGB(24, 24, 30);
+static const COLORREF kDivider    = RGB(44, 44, 54);
+static const COLORREF kLabel      = RGB(212, 212, 221);
+static const COLORREF kMuted      = RGB(138, 138, 150);
+static const COLORREF kChipBg     = RGB(36, 36, 45);
+static const COLORREF kChipBorder = RGB(56, 56, 69);
+static const COLORREF kValueText  = RGB(233, 233, 240);
+static const COLORREF kAccent     = RGB(62, 94, 240);
+static const COLORREF kAccentHi   = RGB(92, 124, 255);
+static const COLORREF kAccentDim  = RGB(38, 56, 142);
+static const COLORREF kOnBg       = RGB(38, 48, 88);
+static const COLORREF kOnBorder   = RGB(80, 110, 255);
+
+// ---------------------------------------------------------------------------
+// 布局常量（96 DPI 逻辑像素，运行时按 DPI 缩放）
+// ---------------------------------------------------------------------------
+static const int kPad        = 24;
+static const int kWinW       = 640;
+static const int kWinH       = 470;
+static const int kTabTop     = 12;
+static const int kTabH       = 30;
+static const int kTabDivider = 54;
+static const int kContentTop = 72;
+static const int kRowH       = 32;
+static const int kRowStep    = 38;
+static const int kBtnH       = 30;
+static const int kBtnW       = 88;
+static const int kTabCount   = 5;
 
 enum SettingsPage {
     PageBasic = 0,
@@ -35,6 +68,47 @@ enum SettingsPage {
     PageWindow,
 };
 
+struct ChipSlot {
+    HWND child = nullptr;
+    RECT rc{};
+};
+
+// 下拉列表类型（每种只有一个实例，作为浮层数据的键）
+enum DropdownKind {
+    DropCycle = 0,
+    DropFormat,
+    DropSource,
+    DropArtAnchor,
+    DropWinAnchor,
+    DropArtSize,
+    DropFont,
+};
+
+struct DropdownDef {
+    HWND trigger = nullptr;             // 显示当前值的胶囊按钮
+    DropdownKind kind = DropCycle;
+    std::vector<std::wstring> items;
+    int current = 0;
+};
+
+// 数字步进器：左减、中值、右加
+struct NumberField {
+    HWND minus = nullptr;
+    HWND edit = nullptr;
+    HWND plus = nullptr;
+    int lo = 0;
+    int hi = 0;
+};
+
+// 下拉浮层窗口的数据（窗口销毁时释放）
+struct SettingsState; // 前置声明
+
+struct DropdownPopupData {
+    SettingsState* st = nullptr;
+    DropdownKind kind = DropCycle;
+    HWND list = nullptr;
+};
+
 struct SettingsState {
     Config cfg;
     HWND   parent = nullptr;
@@ -42,510 +116,1301 @@ struct SettingsState {
     bool   saved  = false;
     bool   running = true;
     UINT   dpi = 96;
+
     HFONT  font = nullptr;
     HFONT  boldFont = nullptr;
+    HBRUSH brBg = nullptr;
+    HBRUSH brChip = nullptr;
 
-    // 控件句柄
-    HWND hTab         = nullptr;
-    HWND hEditTitle   = nullptr;
-    HWND hDtpDate     = nullptr;
-    HWND hDtpTime     = nullptr;
-    HWND hCheckCycle  = nullptr;
-    HWND hComboCycle  = nullptr;
-    HWND hCheckStart  = nullptr;
-    HWND hComboFmt    = nullptr;
-    HWND hEditSize    = nullptr;
-    HWND hUdSize      = nullptr;
-    HWND hComboFont   = nullptr;
-    HWND hComboHkSrc  = nullptr;
+    int  page = PageBasic;
+    int  hoverTab = -1;
+    bool trackingMouse = false;
+
+    // 布尔胶囊的状态（BS_OWNERDRAW 不能与 BS_AUTOCHECKBOX 共存，需自己维护）
+    bool optStart = false;
+    bool optArticle = false;
+    bool optArtTop = false;
+    bool optTopMost = false;
+    bool optAutoStart = false;
+    bool optDummy = false; // ToggleRef 的兜底
+
+    std::vector<RECT> tabRects;
+    std::vector<HWND> pages[kTabCount];
+    std::vector<ChipSlot> chips[kTabCount];
+    std::vector<int> rowDividerY[kTabCount];
+
+    HWND hEditTitle = nullptr;
+    HWND hEditDate = nullptr;
+    HWND hBtnCalendar = nullptr;
+    HWND hEditTime = nullptr;
+    HWND hBtnCycle = nullptr;
+    HWND hBtnStart = nullptr;
+    HWND hBtnFormat = nullptr;
+    HWND hEditSize = nullptr;
+    HWND hBtnHkSrc = nullptr;
     HWND hEditHkRefresh = nullptr;
-    HWND hUdHkRefresh = nullptr;
-    HWND hCheckArticle = nullptr;
-    HWND hComboArtAnchor = nullptr;
-    HWND hEditArtX     = nullptr;
-    HWND hEditArtY     = nullptr;
-    HWND hEditArtH     = nullptr;
-    HWND hUdArtH       = nullptr;
-    HWND hEditArtM     = nullptr;
-    HWND hUdArtM       = nullptr;
-    HWND hEditArtS     = nullptr;
-    HWND hUdArtS       = nullptr;
-    HWND hCheckArtTop  = nullptr;
-    HWND hEditArtFont  = nullptr;
-    HWND hUdArtFont    = nullptr;
-    HWND hComboArtSize = nullptr;
+    HWND hBtnArticle = nullptr;
+    HWND hBtnArtAnchor = nullptr;
+    HWND hEditArtX = nullptr;
+    HWND hEditArtY = nullptr;
+    HWND hEditArtH = nullptr;
+    HWND hEditArtM = nullptr;
+    HWND hEditArtS = nullptr;
+    HWND hBtnArtTop = nullptr;
+    HWND hEditArtFont = nullptr;
+    HWND hBtnArtSize = nullptr;
     HWND hEditArtWidth = nullptr;
     HWND hEditArtHeight = nullptr;
-    HWND hCheckTop    = nullptr;
-    HWND hComboAnchor = nullptr;
-    HWND hEditPlaceX  = nullptr;
-    HWND hEditPlaceY  = nullptr;
-    HWND hCheckAuto   = nullptr;
+    HWND hBtnTop = nullptr;
+    HWND hBtnAnchor = nullptr;
+    HWND hEditPlaceX = nullptr;
+    HWND hEditPlaceY = nullptr;
+    HWND hBtnAuto = nullptr;
+    HWND hBtnSave = nullptr;
+    HWND hBtnCancel = nullptr;
 
-    RECT pageRect{};
-    std::vector<HWND> pages[kTabCount];
+    HWND hCalPopup = nullptr;       // 日期月历（子窗口浮层）
+    HWND hCalPrevYear = nullptr;    // 月历上方的“上一年”
+    HWND hCalNextYear = nullptr;    // 月历上方的“下一年”
+    HWND hDropdown = nullptr;       // 下拉列表浮层（子窗口）
+    HWND hDropdownTrigger = nullptr; // 当前打开下拉的触发按钮
 
-    int S(int value) const { return utils::ScaleDpi(value, static_cast<int>(dpi)); }
+    std::vector<DropdownDef> dropdowns;
+    std::vector<NumberField> numbers;
+
+    int S(int value) const {
+        return utils::ScaleDpi(value, static_cast<int>(dpi));
+    }
 };
 
 // ---------------------------------------------------------------------------
 static const wchar_t* kClass = L"CountdownSettingsClass";
+static const wchar_t* kDropdownClass = L"CountdownSettingsDropdown";
+static const wchar_t* kTabNames[kTabCount] = {
+    L"\u57fa\u672c",                    // 基本
+    L"\u5916\u89c2",                    // 外观
+    L"\u4e00\u8a00",                    // 一言
+    L"\u4e00\u6587",                    // 一文
+    L"\u7a97\u53e3\u4e0e\u542f\u52a8",  // 窗口与启动
+};
 
 // 前置声明
 static LRESULT CALLBACK SettingsWndProc(HWND, UINT, WPARAM, LPARAM);
+static LRESULT CALLBACK DropdownWndProc(HWND, UINT, WPARAM, LPARAM);
+static bool RegisterDropdownClass(HINSTANCE hInst);
 static void OnCreate(HWND hwnd, SettingsState* st);
 static bool CollectAndValidate(HWND hwnd, SettingsState* st);
 static void ShowPage(SettingsState* st, int page);
+static void LayoutTabs(SettingsState* st, HWND hwnd);
+static void CloseCalendarPopup(SettingsState* st);
+static void CloseDropdown(SettingsState* st);
+static void OpenDropdown(SettingsState* st, DropdownDef* def);
 
-// 注意：函数名刻意避开 RegisterClass（windows.h 中是宏，会展开为 RegisterClassW）
-static bool RegisterSettingsClass(HINSTANCE hInst) {
-    WNDCLASSEXW exist{};
-    if (GetClassInfoExW(hInst, kClass, &exist) != 0) return true; // 已注册
-    WNDCLASSEXW wc{};
-    wc.cbSize        = sizeof(wc);
-    wc.style         = CS_HREDRAW | CS_VREDRAW;
-    wc.lpfnWndProc   = SettingsWndProc; // 使用自有窗口过程
-    wc.hInstance     = hInst;
-    wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-    wc.lpszClassName = kClass;
-    wc.hIcon         = nullptr;
-    return RegisterClassExW(&wc) != 0;
+// ---------------------------------------------------------------------------
+// 文本辅助
+// ---------------------------------------------------------------------------
+static std::wstring FormatDateText(const std::tm& t) {
+    wchar_t buf[32];
+    swprintf_s(buf, L"%04d-%02d-%02d", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
+    return buf;
+}
+
+static std::wstring FormatClockText(const std::tm& t) {
+    wchar_t buf[32];
+    swprintf_s(buf, L"%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
+    return buf;
+}
+
+// 下拉列表内容：顺序必须与对应枚举值一致
+static std::vector<std::wstring> CycleItems() {
+    return {
+        L"\u5173\u95ed",            // 关闭（None=0）
+        L"\u6bcf\u5e74",            // 每年
+        L"\u6bcf\u6708",            // 每月
+        L"\u6bcf\u5929",            // 每天
+        L"\u6bcf\u5c0f\u65f6",      // 每小时
+        L"\u6bcf\u5206\u949f",      // 每分钟
+        L"\u6bcf\u79d2",            // 每秒
+    };
+}
+
+static std::vector<std::wstring> FormatItems() {
+    return {
+        L"\u65f6:\u5206:\u79d2",                 // HMS
+        L"\u5e74\u6708\u65e5 \u65f6\u5206\u79d2", // Full
+        L"\u5929\u6570 \u65f6:\u5206:\u79d2",     // Days
+    };
+}
+
+static std::vector<std::wstring> SourceItems() {
+    return {
+        L"\u672c\u5730",                       // 本地
+        L"\u7f51\u7edc",                       // 网络
+        L"\u672c\u5730\u548c\u7f51\u7edc",     // 本地和网络
+    };
+}
+
+static std::vector<std::wstring> AnchorItems() {
+    return {
+        L"\u5de6\u4e0a\u89d2",   L"\u9876\u90e8\u5c45\u4e2d", L"\u53f3\u4e0a\u89d2",
+        L"\u5de6\u5c45\u4e2d",   L"\u5c4f\u5e55\u5c45\u4e2d", L"\u53f3\u5c45\u4e2d",
+        L"\u5de6\u4e0b\u89d2",   L"\u5e95\u90e8\u5c45\u4e2d", L"\u53f3\u4e0b\u89d2",
+    };
+}
+
+static std::vector<std::wstring> ArticleSizeItems() {
+    return {
+        L"\u81ea\u9002\u5e94\uff08\u56fa\u5b9a\u5bbd\uff09", // 自适应（固定宽）
+        L"\u5168\u81ea\u9002\u5e94",                       // 全自适应
+        L"\u81ea\u5b9a\u4e49",                             // 自定义
+    };
+}
+
+// 严格解析整数输入：允许首尾空白，空文本按 0 处理
+static bool ParseIntField(HWND edit, int& out) {
+    wchar_t buf[256] = {0};
+    GetWindowTextW(edit, buf, 256);
+
+    const wchar_t* p = buf;
+    while (*p == L' ' || *p == L'\t') ++p;
+    if (*p == L'\0') { out = 0; return true; }
+
+    errno = 0;
+    wchar_t* end = nullptr;
+    long v = wcstol(p, &end, 10);
+    if (end == p || errno == ERANGE) return false;
+    while (*end == L' ' || *end == L'\t') ++end;
+    if (*end != L'\0') return false;
+
+    out = static_cast<int>(v);
+    return true;
+}
+
+static DropdownDef* FindDropdownByKind(SettingsState* st, DropdownKind kind) {
+    for (auto& d : st->dropdowns) {
+        if (d.kind == kind) return &d;
+    }
+    return nullptr;
+}
+
+static DropdownDef* FindDropdownByTrigger(SettingsState* st, HWND trigger) {
+    for (auto& d : st->dropdowns) {
+        if (d.trigger == trigger) return &d;
+    }
+    return nullptr;
+}
+
+// 选中下拉项：写入配置并更新触发按钮文字
+static void ApplyDropdownSelection(SettingsState* st, DropdownDef* def, int index) {
+    if (!st || !def || index < 0 || index >= static_cast<int>(def->items.size())) {
+        return;
+    }
+    def->current = index;
+    switch (def->kind) {
+        case DropCycle:      st->cfg.cycle = static_cast<CycleUnit>(index); break;
+        case DropFormat:     st->cfg.displayFormat =
+                                 static_cast<utils::DisplayFormat>(index); break;
+        case DropSource:     st->cfg.hitokotoSource =
+                                 static_cast<HitokotoSource>(index); break;
+        case DropArtAnchor:  st->cfg.articleAnchor =
+                                 static_cast<WindowAnchor>(index); break;
+        case DropWinAnchor:  st->cfg.anchor = static_cast<WindowAnchor>(index); break;
+        case DropArtSize:    st->cfg.articleSizeMode =
+                                 static_cast<ArticleSizeMode>(index); break;
+        case DropFont:       st->cfg.font = def->items[index]; break;
+    }
+    SetWindowTextW(def->trigger, def->items[index].c_str());
+    InvalidateRect(def->trigger, nullptr, TRUE);
+}
+
+// 步进器：按一次加/减 1 并钳制在范围内
+static void AdjustNumber(NumberField& f, int delta) {
+    int v = f.lo;
+    if (!ParseIntField(f.edit, v)) v = f.lo;
+    v += delta;
+    if (v < f.lo) v = f.lo;
+    if (v > f.hi) v = f.hi;
+    wchar_t buf[32];
+    swprintf_s(buf, L"%d", v);
+    SetWindowTextW(f.edit, buf);
+}
+
+static void CloseDropdown(SettingsState* st) {
+    if (!st) return;
+    if (st->hDropdown) {
+        HWND h = st->hDropdown;
+        st->hDropdown = nullptr;
+        st->hDropdownTrigger = nullptr;
+        DestroyWindow(h);
+    }
 }
 
 // ---------------------------------------------------------------------------
-// 创建子控件的小工具
+// 窗口类
 // ---------------------------------------------------------------------------
-static HWND CreateLabel(SettingsState* st, HWND parent, const wchar_t* text,
-                        int x, int y, int page) {
-    HWND h = CreateWindowW(L"STATIC", text, WS_CHILD | WS_VISIBLE | SS_RIGHT,
-                           x, y, st->S(kLabelW), st->S(kRowH), parent, nullptr,
-                           (HINSTANCE)GetWindowLongPtrW(parent, GWLP_HINSTANCE),
-                           nullptr);
-    if (h) st->pages[page].push_back(h);
-    return h;
+static bool RegisterSettingsClass(HINSTANCE hInst) {
+    WNDCLASSEXW exist{};
+    if (GetClassInfoExW(hInst, kClass, &exist) == 0) {
+        WNDCLASSEXW wc{};
+        wc.cbSize        = sizeof(wc);
+        wc.style         = 0;
+        wc.lpfnWndProc   = SettingsWndProc;
+        wc.hInstance     = hInst;
+        wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
+        wc.hbrBackground = nullptr; // 自绘深色背景
+        wc.lpszClassName = kClass;
+        if (!RegisterClassExW(&wc)) return false;
+    }
+    // 下拉浮层类与设置窗口同生命周期，顺带保证已注册
+    return RegisterDropdownClass(hInst);
+}
+
+// ---------------------------------------------------------------------------
+// 控件创建辅助
+// ---------------------------------------------------------------------------
+static HINSTANCE InstOf(HWND h) {
+    return (HINSTANCE)GetWindowLongPtrW(h, GWLP_HINSTANCE);
 }
 
 static HWND CreateChild(SettingsState* st, int page, const wchar_t* cls,
                         const wchar_t* text, DWORD style, DWORD exStyle,
-                        int x, int y, int w, int h, int id, HWND parent) {
+                        int x, int y, int w, int h, int id, HWND parent,
+                        bool tabStop = true) {
+    // 可交互控件统一补 WS_TABSTOP；步进器的 −/+ 按钮显式关闭，避免 Tab 过于琐碎
+    if (tabStop && (style & WS_CHILD) &&
+        (lstrcmpiW(cls, L"EDIT") == 0 || lstrcmpiW(cls, L"BUTTON") == 0 ||
+         lstrcmpiW(cls, L"COMBOBOX") == 0)) {
+        style |= WS_TABSTOP;
+    }
     HWND hwnd = CreateWindowExW(exStyle, cls, text, style, x, y, w, h,
-                                parent, (HMENU)(INT_PTR)id,
-                                (HINSTANCE)GetWindowLongPtrW(parent, GWLP_HINSTANCE),
+                                parent, (HMENU)(INT_PTR)id, InstOf(parent),
                                 nullptr);
-    if (hwnd) st->pages[page].push_back(hwnd);
+    if (hwnd && page >= 0 && page < kTabCount) st->pages[page].push_back(hwnd);
     return hwnd;
 }
 
-// 把 std::tm 转为 SYSTEMTIME
-static void TmToSystem(const std::tm& t, SYSTEMTIME& st) {
-    st.wYear   = static_cast<WORD>(t.tm_year + 1900);
-    st.wMonth  = static_cast<WORD>(t.tm_mon + 1);
-    st.wDay    = static_cast<WORD>(t.tm_mday);
-    st.wDayOfWeek = 0;
-    st.wHour   = static_cast<WORD>(t.tm_hour);
-    st.wMinute = static_cast<WORD>(t.tm_min);
-    st.wSecond = static_cast<WORD>(t.tm_sec);
-    st.wMilliseconds = 0;
+static HWND CreateLabel(SettingsState* st, HWND parent, const wchar_t* text,
+                        int x, int y, int page) {
+    HWND h = CreateWindowExW(0, L"STATIC", text,
+        WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
+        x, y, st->S(210), st->S(kRowH), parent, nullptr, InstOf(parent), nullptr);
+    if (h) st->pages[page].push_back(h);
+    return h;
 }
 
-static void SystemToTm(const SYSTEMTIME& st, std::tm& t) {
-    t = std::tm{};
-    t.tm_year = st.wYear - 1900;
-    t.tm_mon  = st.wMonth - 1;
-    t.tm_mday = st.wDay;
-    t.tm_hour = st.wHour;
-    t.tm_min  = st.wMinute;
-    t.tm_sec  = st.wSecond;
-    t.tm_isdst = -1;
+static bool IsToggleId(int id) {
+    return id == IDC_CHECK_INCLUDE_START || id == IDC_CHECK_ARTICLE ||
+           id == IDC_CHECK_ARTICLE_TOP || id == IDC_CHECK_TOPMOST ||
+           id == IDC_CHECK_AUTOSTART;
+}
+
+static bool& ToggleRef(SettingsState* st, int id) {
+    switch (id) {
+        case IDC_CHECK_INCLUDE_START: return st->optStart;
+        case IDC_CHECK_ARTICLE:       return st->optArticle;
+        case IDC_CHECK_ARTICLE_TOP:   return st->optArtTop;
+        case IDC_CHECK_TOPMOST:       return st->optTopMost;
+        case IDC_CHECK_AUTOSTART:     return st->optAutoStart;
+        default:                      return st->optDummy;
+    }
 }
 
 // ---------------------------------------------------------------------------
-// 标签页切换
+// 标签页布局/切换
 // ---------------------------------------------------------------------------
+static void LayoutTabs(SettingsState* st, HWND hwnd) {
+    st->tabRects.clear();
+    HDC dc = GetDC(hwnd);
+    if (!dc) return;
+    HFONT old = (HFONT)SelectObject(dc, st->boldFont ? st->boldFont : st->font);
+    int x = st->S(kPad);
+    int y = st->S(kTabTop);
+    int h = st->S(kTabH);
+    for (int i = 0; i < kTabCount; ++i) {
+        SIZE sz{};
+        GetTextExtentPoint32W(dc, kTabNames[i],
+                             static_cast<int>(wcslen(kTabNames[i])), &sz);
+        int w = sz.cx + st->S(28);
+        st->tabRects.push_back(RECT{x, y, x + w, y + h});
+        x += w + st->S(6);
+    }
+    if (old) SelectObject(dc, old);
+    ReleaseDC(hwnd, dc);
+}
+
 static void ShowPage(SettingsState* st, int page) {
+    if (!st) return;
+    CloseDropdown(st);
+    CloseCalendarPopup(st);
+    st->page = page;
     for (int i = 0; i < kTabCount; ++i) {
         int cmd = (i == page) ? SW_SHOW : SW_HIDE;
         for (HWND h : st->pages[i]) {
             if (h) ShowWindow(h, cmd);
         }
     }
-}
-
-// 按尺寸模式启用/禁用宽高输入
-static void UpdateArticleSizeControls(SettingsState* st) {
-    if (!st || !st->hComboArtSize) return;
-    int mode = ComboBox_GetCurSel(st->hComboArtSize);
-    bool widthEnabled  = (mode == 0 || mode == 2); // 固定宽 / 自定义
-    bool heightEnabled = (mode == 2);              // 仅自定义
-    if (st->hEditArtWidth)  EnableWindow(st->hEditArtWidth, widthEnabled ? TRUE : FALSE);
-    if (st->hEditArtHeight) EnableWindow(st->hEditArtHeight, heightEnabled ? TRUE : FALSE);
+    if (st->dlg) InvalidateRect(st->dlg, nullptr, TRUE);
 }
 
 // ---------------------------------------------------------------------------
-// WM_CREATE 处理：创建标签页与所有子控件，并填入当前值
+// 自绘
+// ---------------------------------------------------------------------------
+static void FillRound(HDC dc, RECT rc, int radius, COLORREF fill,
+                      COLORREF border, int borderW = 1) {
+    HBRUSH br = CreateSolidBrush(fill);
+    HPEN pen = CreatePen(PS_SOLID, borderW, border);
+    HGDIOBJ ob = SelectObject(dc, br);
+    HGDIOBJ op = SelectObject(dc, pen);
+    RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+    DeleteObject(br);
+    DeleteObject(pen);
+}
+
+static void DrawCentered(HDC dc, RECT rc, const wchar_t* text,
+                         HFONT font, COLORREF color) {
+    HFONT old = font ? (HFONT)SelectObject(dc, font) : nullptr;
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, color);
+    DrawTextW(dc, text, -1, &rc,
+              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    if (old) SelectObject(dc, old);
+}
+
+static void PaintDialog(HWND hwnd, SettingsState* st) {
+    PAINTSTRUCT ps{};
+    HDC dc = BeginPaint(hwnd, &ps);
+    if (!dc) return;
+
+    RECT cr{};
+    GetClientRect(hwnd, &cr);
+    int w = cr.right;
+    int h = cr.bottom;
+    if (w <= 0 || h <= 0 || !st->brBg) { EndPaint(hwnd, &ps); return; }
+
+    HDC mem = CreateCompatibleDC(dc);
+    HBITMAP bmp = CreateCompatibleBitmap(dc, w, h);
+    HGDIOBJ oldBmp = SelectObject(mem, bmp);
+
+    FillRect(mem, &cr, st->brBg);
+    FillRound(mem, RECT{0, 0, w - 1, h - 1}, st->S(24), kBg, kChipBorder);
+
+    // ---- 胶囊标签页 ----
+    for (int i = 0; i < kTabCount && i < static_cast<int>(st->tabRects.size()); ++i) {
+        RECT r = st->tabRects[i];
+        if (i == st->page) {
+            RECT glow = r;
+            InflateRect(&glow, st->S(2), st->S(2));
+            FillRound(mem, glow, st->S(17), kAccentDim, kAccentDim);
+            FillRound(mem, r, st->S(15), kAccent, kAccentHi);
+            DrawCentered(mem, r, kTabNames[i], st->boldFont, RGB(255, 255, 255));
+        } else if (i == st->hoverTab) {
+            FillRound(mem, r, st->S(15), kChipBg, kChipBg);
+            DrawCentered(mem, r, kTabNames[i], st->font, kLabel);
+        } else {
+            DrawCentered(mem, r, kTabNames[i], st->font, kMuted);
+        }
+    }
+
+    // ---- 分隔线 ----
+    HPEN penDiv = CreatePen(PS_SOLID, 1, kDivider);
+    HGDIOBJ oldPen = SelectObject(mem, penDiv);
+    MoveToEx(mem, st->S(kPad), st->S(kTabDivider), nullptr);
+    LineTo(mem, w - st->S(kPad), st->S(kTabDivider));
+
+    if (st->page >= 0 && st->page < kTabCount) {
+        for (int y : st->rowDividerY[st->page]) {
+            MoveToEx(mem, st->S(kPad), y, nullptr);
+            LineTo(mem, w - st->S(kPad), y);
+        }
+    }
+
+    // ---- 值胶囊底 ----
+    if (st->page >= 0 && st->page < kTabCount) {
+        HWND focus = GetFocus();
+        for (const ChipSlot& chip : st->chips[st->page]) {
+            bool focused = chip.child && chip.child == focus;
+            FillRound(mem, chip.rc, st->S(8), kChipBg,
+                      focused ? kAccent : kChipBorder);
+        }
+    }
+
+    // ---- 底部按钮分隔线与制作者信息 ----
+    int btnY = h - st->S(kPad) - st->S(kBtnH);
+    MoveToEx(mem, st->S(kPad), btnY - st->S(12), nullptr);
+    LineTo(mem, w - st->S(kPad), btnY - st->S(12));
+    SelectObject(mem, oldPen);
+    DeleteObject(penDiv);
+
+    SetBkMode(mem, TRANSPARENT);
+    SetTextColor(mem, kMuted);
+    HFONT oldFont = (HFONT)SelectObject(mem, st->font);
+    RECT credit{st->S(kPad), btnY, w - st->S(kPad) - st->S(2 * kBtnW + 12),
+                btnY + st->S(kBtnH)};
+    DrawTextW(mem, L"\u5236\u4f5c\uff1aBu Xin    \u90ae\u7bb1\uff1abuxin0912@qq.com",
+              -1, &credit,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    SelectObject(mem, oldFont);
+
+    BitBlt(dc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
+    SelectObject(mem, oldBmp);
+    DeleteObject(bmp);
+    DeleteDC(mem);
+    EndPaint(hwnd, &ps);
+}
+
+// 自绘按钮：开关、枚举值、保存/取消、日历
+static void DrawOwnerButton(SettingsState* st, DRAWITEMSTRUCT* dis) {
+    if (!st || !dis || dis->CtlType != ODT_BUTTON) return;
+
+    RECT rc = dis->rcItem;
+    bool pressed = (dis->itemState & ODS_SELECTED) != 0;
+    bool focused = (dis->itemState & ODS_FOCUS) != 0;
+    int radius = std::min(st->S(8), static_cast<int>(rc.bottom - rc.top) / 2);
+    HDC dc = dis->hDC;
+
+    if (dis->CtlID == IDC_BTN_SAVE) {
+        FillRound(dc, rc, radius,
+                  pressed ? RGB(48, 74, 196) : kAccent, kAccentHi);
+        DrawCentered(dc, rc, L"\u4fdd\u5b58", st->boldFont, RGB(255, 255, 255));
+        return;
+    }
+    if (dis->CtlID == IDC_BTN_CANCEL) {
+        FillRound(dc, rc, radius,
+                  pressed ? RGB(48, 48, 60) : kChipBg, kChipBorder);
+        DrawCentered(dc, rc, L"\u53d6\u6d88", st->font, kLabel);
+        return;
+    }
+    if (dis->CtlID == IDC_BTN_CALENDAR) {
+        FillRound(dc, rc, radius,
+                  pressed ? RGB(48, 48, 60) : kChipBg,
+                  focused ? kAccent : kChipBorder);
+        int cx = (rc.left + rc.right) / 2;
+        int cy = (rc.top + rc.bottom) / 2;
+        HPEN pen = CreatePen(PS_SOLID, std::max(1, st->S(1)), kLabel);
+        HGDIOBJ op = SelectObject(dc, pen);
+        MoveToEx(dc, cx - st->S(4), cy - st->S(2), nullptr);
+        LineTo(dc, cx, cy + st->S(2));
+        LineTo(dc, cx + st->S(4), cy - st->S(2));
+        SelectObject(dc, op);
+        DeleteObject(pen);
+        return;
+    }
+    if (dis->CtlID == IDC_BTN_STEP_MINUS || dis->CtlID == IDC_BTN_STEP_PLUS) {
+        FillRound(dc, rc, radius,
+                  pressed ? RGB(46, 46, 57) : kChipBg, kChipBorder);
+        int cx = (rc.left + rc.right) / 2;
+        int cy = (rc.top + rc.bottom) / 2;
+        int arm = st->S(4);
+        HPEN pen = CreatePen(PS_SOLID, std::max(1, st->S(1)), kLabel);
+        HGDIOBJ op = SelectObject(dc, pen);
+        MoveToEx(dc, cx - arm, cy, nullptr);
+        LineTo(dc, cx + arm + 1, cy);
+        if (dis->CtlID == IDC_BTN_STEP_PLUS) {
+            MoveToEx(dc, cx, cy - arm, nullptr);
+            LineTo(dc, cx, cy + arm + 1);
+        }
+        SelectObject(dc, op);
+        DeleteObject(pen);
+        return;
+    }
+    if (IsToggleId(dis->CtlID)) {
+        bool on = ToggleRef(st, dis->CtlID);
+        COLORREF fill = on ? (pressed ? RGB(48, 60, 110) : kOnBg) : kChipBg;
+        COLORREF border = on ? kOnBorder : (focused ? kAccent : kChipBorder);
+        FillRound(dc, rc, radius, fill, border);
+        DrawCentered(dc, rc, on ? L"\u5f00" : L"\u5173", st->font,
+                     on ? kValueText : kMuted);
+        return;
+    }
+    if (FindDropdownByTrigger(st, dis->hwndItem)) {
+        bool open = (st->hDropdownTrigger == dis->hwndItem);
+        FillRound(dc, rc, radius,
+                  pressed ? RGB(46, 46, 57) : kChipBg,
+                  open ? kAccentHi : (focused ? kAccent : kChipBorder));
+
+        wchar_t text[256] = {0};
+        GetWindowTextW(dis->hwndItem, text, 256);
+        RECT trc = rc;
+        trc.left += st->S(10);
+        trc.right -= st->S(24);
+        HFONT old = (HFONT)SelectObject(dc, st->font);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, kValueText);
+        DrawTextW(dc, text, -1, &trc,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX
+                      | DT_END_ELLIPSIS);
+        if (old) SelectObject(dc, old);
+
+        int cx = rc.right - st->S(13);
+        int cy = (rc.top + rc.bottom) / 2;
+        HPEN pen = CreatePen(PS_SOLID, std::max(1, st->S(1)), kMuted);
+        HGDIOBJ op = SelectObject(dc, pen);
+        MoveToEx(dc, cx - st->S(3), cy - st->S(2), nullptr);
+        LineTo(dc, cx, cy + st->S(2));
+        LineTo(dc, cx + st->S(3), cy - st->S(2));
+        SelectObject(dc, op);
+        DeleteObject(pen);
+        return;
+    }
+
+    // 其余自绘按钮（预留）
+    wchar_t text[128] = {0};
+    GetWindowTextW(dis->hwndItem, text, 128);
+    FillRound(dc, rc, radius,
+              pressed ? RGB(46, 46, 57) : kChipBg,
+              focused ? kAccent : kChipBorder);
+    DrawCentered(dc, rc, text, st->font, kValueText);
+}
+
+// ---------------------------------------------------------------------------
+// 深色下拉浮层（子窗口，避免独立弹窗的焦点/激活问题）
+// ---------------------------------------------------------------------------
+static bool RegisterDropdownClass(HINSTANCE hInst) {
+    WNDCLASSEXW exist{};
+    if (GetClassInfoExW(hInst, kDropdownClass, &exist) != 0) return true;
+    WNDCLASSEXW wc{};
+    wc.cbSize        = sizeof(wc);
+    wc.style         = 0;
+    wc.lpfnWndProc   = DropdownWndProc;
+    wc.hInstance     = hInst;
+    wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
+    wc.hbrBackground = nullptr;
+    wc.lpszClassName = kDropdownClass;
+    return RegisterClassExW(&wc) != 0;
+}
+
+static LRESULT CALLBACK DropdownWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    DropdownPopupData* data = reinterpret_cast<DropdownPopupData*>(
+        GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (msg == WM_NCCREATE) {
+        auto cs = reinterpret_cast<CREATESTRUCT*>(lp);
+        data = reinterpret_cast<DropdownPopupData*>(cs->lpCreateParams);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(data));
+    }
+
+    switch (msg) {
+        case WM_CREATE: {
+            if (!data) return -1;
+            RECT cr{};
+            GetClientRect(hwnd, &cr);
+            SetWindowRgn(hwnd,
+                CreateRoundRectRgn(0, 0, cr.right + 1, cr.bottom + 1,
+                                   data->st->S(12), data->st->S(12)), TRUE);
+            int pad = data->st->S(5);
+            data->list = CreateWindowExW(0, L"LISTBOX", L"",
+                WS_CHILD | WS_VISIBLE | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS
+                    | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL,
+                pad, pad, cr.right - 2 * pad, cr.bottom - 2 * pad,
+                hwnd, (HMENU)(INT_PTR)IDC_DROPDOWN_LIST, InstOf(hwnd), nullptr);
+            if (!data->list) return -1;
+            SendMessageW(data->list, WM_SETFONT, (WPARAM)data->st->font, TRUE);
+
+            SendMessageW(data->list, LB_SETITEMHEIGHT, 0, data->st->S(22));
+            DropdownDef* def = FindDropdownByKind(data->st, data->kind);
+            if (def) {
+                for (const auto& item : def->items) {
+                    SendMessageW(data->list, LB_ADDSTRING, 0, (LPARAM)item.c_str());
+                }
+                // 不预选当前项：这样点击任何一项（包括当前项）都会触发
+                // LBN_SELCHANGE，避免“点当前项没反应”
+                int top = def->current - 3;
+                if (top < 0) top = 0;
+                SendMessageW(data->list, LB_SETTOPINDEX, top, 0);
+            }
+            return 0;
+        }
+
+        case WM_SHOWWINDOW:
+            if (wp && data && data->list) SetFocus(data->list);
+            return 0;
+
+        case WM_ERASEBKGND:
+            return 1;
+
+        case WM_PAINT: {
+            PAINTSTRUCT ps{};
+            HDC dc = BeginPaint(hwnd, &ps);
+            RECT cr{};
+            GetClientRect(hwnd, &cr);
+            if (data && data->st->brChip) FillRect(dc, &cr, data->st->brChip);
+            HPEN pen = CreatePen(PS_SOLID, 1, kChipBorder);
+            HGDIOBJ op = SelectObject(dc, pen);
+            HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
+            Rectangle(dc, 0, 0, cr.right, cr.bottom);
+            SelectObject(dc, op);
+            SelectObject(dc, ob);
+            DeleteObject(pen);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+
+        case WM_CTLCOLORLISTBOX:
+            if (data && data->st->brChip) {
+                HDC dc = reinterpret_cast<HDC>(wp);
+                SetBkColor(dc, kChipBg);
+                SetTextColor(dc, kValueText);
+                return reinterpret_cast<LRESULT>(data->st->brChip);
+            }
+            break;
+
+        case WM_DRAWITEM: {
+            auto* dis = reinterpret_cast<DRAWITEMSTRUCT*>(lp);
+            if (!data || !dis || dis->CtlType != ODT_LISTBOX) break;
+            int index = static_cast<int>(dis->itemID);
+            if (index < 0) return TRUE;
+
+            DropdownDef* def = FindDropdownByKind(data->st, data->kind);
+            // 直接取配置里的原始字符串，不依赖 LB_GETTEXT，
+            // 避免 owner-draw 列表字符串存储差异导致乱码
+            const wchar_t* text = L"";
+            if (def && index >= 0 && index < static_cast<int>(def->items.size())) {
+                text = def->items[index].c_str();
+            }
+            bool selected = (dis->itemState & ODS_SELECTED) != 0;
+            bool current = def && index == def->current;
+            COLORREF bg = selected ? kAccent : (current ? RGB(44, 52, 78) : kChipBg);
+            HBRUSH br = CreateSolidBrush(bg);
+            FillRect(dis->hDC, &dis->rcItem, br);
+            DeleteObject(br);
+
+            RECT trc = dis->rcItem;
+            trc.left += data->st->S(10);
+            trc.right -= data->st->S(8);
+            HFONT old = (HFONT)SelectObject(dis->hDC, data->st->font);
+            SetBkMode(dis->hDC, TRANSPARENT);
+            SetTextColor(dis->hDC,
+                         selected ? RGB(255, 255, 255)
+                                  : (current ? RGB(235, 240, 255) : kValueText));
+            DrawTextW(dis->hDC, text, -1, &trc,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX
+                          | DT_END_ELLIPSIS);
+            if (old) SelectObject(dis->hDC, old);
+            return TRUE;
+        }
+
+        case WM_COMMAND: {
+            if (!data) break;
+            if (LOWORD(wp) == IDC_DROPDOWN_LIST && HIWORD(wp) == LBN_SELCHANGE) {
+                int index = static_cast<int>(
+                    SendMessageW(data->list, LB_GETCURSEL, 0, 0));
+                DropdownDef* def = FindDropdownByKind(data->st, data->kind);
+                if (def && index >= 0) {
+                    HWND trigger = def->trigger;
+                    ApplyDropdownSelection(data->st, def, index);
+                    if (trigger && IsWindow(trigger)) SetFocus(trigger);
+                    // 延后销毁：不要在该列表自身的通知里销毁它
+                    PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                } else {
+                    CloseDropdown(data->st);
+                }
+                return 0;
+            }
+            break;
+        }
+
+        case WM_LBUTTONDOWN:
+            return 0;
+
+        case WM_CLOSE:
+            DestroyWindow(hwnd);
+            return 0;
+
+        case WM_DESTROY:
+            if (data) {
+                if (data->st->hDropdown == hwnd) {
+                    data->st->hDropdown = nullptr;
+                    data->st->hDropdownTrigger = nullptr;
+                }
+                delete data;
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            }
+            return 0;
+
+        default:
+            break;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void OpenDropdown(SettingsState* st, DropdownDef* def) {
+    if (!st || !st->dlg || !def || !def->trigger) return;
+    if (st->hDropdown && st->hDropdownTrigger == def->trigger) {
+        CloseDropdown(st);
+        return;
+    }
+    CloseDropdown(st);
+    CloseCalendarPopup(st);
+
+    RECT tr{};
+    GetWindowRect(def->trigger, &tr);
+    MapWindowPoints(HWND_DESKTOP, st->dlg, reinterpret_cast<POINT*>(&tr), 2);
+
+    RECT cr{};
+    GetClientRect(st->dlg, &cr);
+    int footerY = cr.bottom - st->S(kPad) - st->S(kBtnH) - st->S(12);
+    int itemH = st->S(22);
+    int count = static_cast<int>(def->items.size());
+    if (count <= 0) return;
+
+    int visible = std::min(count, 9);
+    int h = visible * itemH + st->S(10);
+    int w = std::max(static_cast<int>(tr.right - tr.left), st->S(180));
+    int maxW = cr.right - 2 * st->S(kPad);
+    if (w > maxW) w = maxW;
+
+    int x = tr.right - w;
+    if (x < st->S(kPad)) x = st->S(kPad);
+    if (x + w > cr.right - st->S(kPad)) x = cr.right - st->S(kPad) - w;
+
+    int y = tr.bottom + st->S(4);
+    if (y + h > footerY) {
+        int above = tr.top - st->S(4) - h;
+        if (above >= st->S(kPad)) {
+            y = above;
+        } else {
+            h = footerY - y;
+            if (h < itemH + st->S(10)) {
+                h = itemH + st->S(10);
+                y = std::max(st->S(kPad), footerY - h);
+            }
+        }
+    }
+    if (h < itemH + st->S(10)) return;
+
+    auto* data = new (std::nothrow) DropdownPopupData();
+    if (!data) return;
+    data->st = st;
+    data->kind = def->kind;
+
+    HWND pop = CreateWindowExW(0, kDropdownClass, L"",
+        WS_CHILD | WS_CLIPSIBLINGS, x, y, w, h,
+        st->dlg, nullptr, InstOf(st->dlg), data);
+    if (!pop) {
+        // CreateWindowEx 失败时若已走过 WM_CREATE，WM_DESTROY 已释放 data；
+        // 这里不再重复 delete
+        return;
+    }
+
+    st->hDropdown = pop;
+    st->hDropdownTrigger = def->trigger;
+    SetWindowPos(pop, HWND_TOP, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE);
+}
+
+// ---------------------------------------------------------------------------
+// 日期弹层（月历 + 年份切换）
+// ---------------------------------------------------------------------------
+static void CloseCalendarPopup(SettingsState* st) {
+    if (st->hCalPrevYear) {
+        DestroyWindow(st->hCalPrevYear);
+        st->hCalPrevYear = nullptr;
+    }
+    if (st->hCalNextYear) {
+        DestroyWindow(st->hCalNextYear);
+        st->hCalNextYear = nullptr;
+    }
+    if (st->hCalPopup) {
+        HWND popup = st->hCalPopup;
+        st->hCalPopup = nullptr;
+        DestroyWindow(popup);
+    }
+}
+
+// 按年切换月历当前选中日期（只改视图，点日期后才回填）
+static void AdjustCalendarYear(SettingsState* st, int delta) {
+    if (!st || !st->hCalPopup) return;
+    SYSTEMTIME cur{};
+    if (!SendMessageW(st->hCalPopup, MCM_GETCURSEL, 0, (LPARAM)&cur)) {
+        cur.wYear = static_cast<WORD>(st->cfg.targetTime.tm_year + 1900);
+        cur.wMonth = static_cast<WORD>(st->cfg.targetTime.tm_mon + 1);
+        cur.wDay = static_cast<WORD>(st->cfg.targetTime.tm_mday);
+    }
+    int year = static_cast<int>(cur.wYear) + delta;
+    if (year < 1753) year = 1753;
+    if (year > 9999) year = 9999;
+    if (year != static_cast<int>(cur.wYear)) {
+        cur.wYear = static_cast<WORD>(year);
+        SendMessageW(st->hCalPopup, MCM_SETCURSEL, 0, (LPARAM)&cur);
+    }
+    SetFocus(st->hCalPopup);
+}
+
+static void OpenCalendarPopup(SettingsState* st) {
+    if (!st || !st->dlg || !st->hBtnCalendar) return;
+    if (st->hCalPopup) {
+        CloseCalendarPopup(st);
+        return;
+    }
+    CloseDropdown(st); // 两个浮层不叠加
+
+    // 子窗口形式：与设置窗口同属一个消息循环，焦点/通知稳定
+    HWND cal = CreateWindowExW(0, MONTHCAL_CLASSW, L"",
+        WS_CHILD | WS_CLIPSIBLINGS, 0, 0, 10, 10,
+        st->dlg, (HMENU)(INT_PTR)IDC_CAL_POPUP, InstOf(st->dlg), nullptr);
+    if (!cal) return;
+
+    // 关闭月历的视觉样式，MCM_SETCOLOR 才会生效，从而得到深色月历
+    SetWindowTheme(cal, L"", L"");
+    SendMessageW(cal, MCM_SETCOLOR, MCSC_BACKGROUND, (LPARAM)kBg);
+    SendMessageW(cal, MCM_SETCOLOR, MCSC_MONTHBK, (LPARAM)kChipBg);
+    SendMessageW(cal, MCM_SETCOLOR, MCSC_TEXT, (LPARAM)kValueText);
+    SendMessageW(cal, MCM_SETCOLOR, MCSC_TITLEBK, (LPARAM)kAccentDim);
+    SendMessageW(cal, MCM_SETCOLOR, MCSC_TITLETEXT, (LPARAM)RGB(235, 239, 255));
+    SendMessageW(cal, MCM_SETCOLOR, MCSC_TRAILINGTEXT, (LPARAM)kMuted);
+
+    RECT need{};
+    SendMessageW(cal, MCM_GETMINREQRECT, 0, (LPARAM)&need);
+    int cw = need.right > 0 ? need.right : st->S(240);
+    int ch = need.bottom > 0 ? need.bottom : st->S(200);
+    int barH = st->S(24);
+    int gap = st->S(4);
+
+    RECT anchor{};
+    GetWindowRect(st->hBtnCalendar, &anchor);
+    MapWindowPoints(HWND_DESKTOP, st->dlg,
+                    reinterpret_cast<POINT*>(&anchor), 2);
+
+    RECT cr{};
+    GetClientRect(st->dlg, &cr);
+    int footerY = cr.bottom - st->S(kPad) - st->S(kBtnH) - st->S(12);
+
+    int blockH = barH + gap + ch;
+    int x = anchor.right - cw;
+    int y = anchor.bottom + st->S(4);
+    if (y + blockH > footerY) {
+        int above = anchor.top - st->S(4) - blockH;
+        if (above >= st->S(kPad)) y = above;
+    }
+    if (y + blockH > footerY) {
+        ch = footerY - y - barH - gap;
+        if (ch < st->S(100)) {
+            DestroyWindow(cal);
+            return;
+        }
+    }
+    if (cw < st->S(180)) {
+        DestroyWindow(cal);
+        return;
+    }
+    if (x < st->S(kPad)) x = st->S(kPad);
+    if (x + cw > cr.right - st->S(kPad)) x = cr.right - st->S(kPad) - cw;
+    if (y < st->S(kPad)) y = st->S(kPad);
+
+    // 年份切换按钮：两条等宽胶囊铺满月历上方，避免点击空隙
+    int btnGap = st->S(4);
+    int bw = (cw - btnGap) / 2;
+    st->hCalPrevYear = CreateWindowExW(0, L"BUTTON",
+        L"\u2039 \u4e0a\u4e00\u5e74",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+        x, y, bw, barH, st->dlg,
+        (HMENU)(INT_PTR)IDC_CAL_PREV_YEAR, InstOf(st->dlg), nullptr);
+    st->hCalNextYear = CreateWindowExW(0, L"BUTTON",
+        L"\u4e0b\u4e00\u5e74 \u203a",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+        x + bw + btnGap, y, cw - bw - btnGap, barH, st->dlg,
+        (HMENU)(INT_PTR)IDC_CAL_NEXT_YEAR, InstOf(st->dlg), nullptr);
+    if (st->font) {
+        SendMessageW(st->hCalPrevYear, WM_SETFONT, (WPARAM)st->font, TRUE);
+        SendMessageW(st->hCalNextYear, WM_SETFONT, (WPARAM)st->font, TRUE);
+    }
+
+    // 当前选中日期：优先取日期胶囊文本，失败则用配置值
+    wchar_t dateBuf[64] = {0};
+    GetWindowTextW(st->hEditDate, dateBuf, 64);
+    SYSTEMTIME cur{};
+    int yy = 0, mm = 0, dd = 0;
+    if (swscanf(dateBuf, L"%d-%d-%d", &yy, &mm, &dd) == 3 &&
+        mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31) {
+        cur.wYear = static_cast<WORD>(yy);
+        cur.wMonth = static_cast<WORD>(mm);
+        cur.wDay = static_cast<WORD>(dd);
+    } else {
+        cur.wYear = static_cast<WORD>(st->cfg.targetTime.tm_year + 1900);
+        cur.wMonth = static_cast<WORD>(st->cfg.targetTime.tm_mon + 1);
+        cur.wDay = static_cast<WORD>(st->cfg.targetTime.tm_mday);
+    }
+    SendMessageW(cal, MCM_SETCURSEL, 0, (LPARAM)&cur);
+
+    SetWindowPos(cal, HWND_TOP, x, y + barH + gap, cw, ch, SWP_SHOWWINDOW);
+    st->hCalPopup = cal;
+    SetFocus(cal);
+}
+
+// ---------------------------------------------------------------------------
+// 创建所有控件
 // ---------------------------------------------------------------------------
 static void OnCreate(HWND hwnd, SettingsState* st) {
-    HINSTANCE hInst = (HINSTANCE)GetWindowLongPtrW(hwnd, GWLP_HINSTANCE);
+    st->brBg = CreateSolidBrush(kBg);
+    st->brChip = CreateSolidBrush(kChipBg);
+    st->page = PageBasic;
+    st->optStart = st->cfg.includeStartDay;
+    st->optArticle = st->cfg.articleEnabled;
+    st->optArtTop = st->cfg.articleIsTop;
+    st->optTopMost = st->cfg.isTop;
+    st->optAutoStart = st->cfg.autoStart;
 
-    // 标签控件
-    st->hTab = CreateWindowExW(0, WC_TABCONTROLW, L"",
-        WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | TCS_HOTTRACK | TCS_FOCUSNEVER
-            | TCS_OWNERDRAWFIXED,
-        st->S(kPadding), st->S(kPadding),
-        st->S(kWinW - 2 * kPadding), st->S(kTabH),
-        hwnd, (HMENU)IDC_TAB_MAIN, hInst, nullptr);
+    LayoutTabs(st, hwnd);
 
-    static const wchar_t* kTabNames[kTabCount] = {
-        L"\u57fa\u672c",        // 基本
-        L"\u5916\u89c2",        // 外观
-        L"\u4e00\u8a00",        // 一言
-        L"\u4e00\u6587",        // 一文
-        L"\u7a97\u53e3\u4e0e\u542f\u52a8", // 窗口与启动
+    RECT cr{};
+    GetClientRect(hwnd, &cr);
+    const int right = cr.right - st->S(kPad);
+    const int rowH = st->S(kRowH);
+    const int top = st->S(kContentTop);
+    int y = top;
+
+    auto makeSlots = [&](int rowY, std::initializer_list<int> widths) {
+        std::vector<RECT> out;
+        int total = 0;
+        int n = static_cast<int>(widths.size());
+        for (int w : widths) total += st->S(w);
+        if (n > 1) total += st->S(6) * (n - 1);
+        int x = right - total;
+        for (int w : widths) {
+            int cw = st->S(w);
+            out.push_back(RECT{x, rowY, x + cw, rowY + rowH});
+            x += cw + st->S(6);
+        }
+        return out;
     };
-    for (int i = 0; i < kTabCount; ++i) {
-        TCITEMW item{};
-        item.mask = TCIF_TEXT;
-        item.pszText = const_cast<wchar_t*>(kTabNames[i]);
-        TabCtrl_InsertItem(st->hTab, i, &item);
-    }
-    TabCtrl_SetCurSel(st->hTab, 0);
-    // 统一标签宽度，选中态更醒目
-    TabCtrl_SetItemSize(st->hTab, st->S(96), st->S(28));
 
-    // 页内容区域（标签控件客户区 -> 显示区域，再偏移到父窗口坐标）
-    RECT rc = {0, 0, st->S(kWinW - 2 * kPadding), st->S(kTabH)};
-    TabCtrl_AdjustRect(st->hTab, FALSE, &rc);
-    OffsetRect(&rc, st->S(kPadding), st->S(kPadding));
-    st->pageRect = rc;
+    auto label = [&](const wchar_t* text, int rowY, int page) {
+        CreateLabel(st, hwnd, text, st->S(kPad), rowY, page);
+    };
 
-    const int ctrlX = rc.left + st->S(kLabelW) + st->S(10);
-    const int ctrlW = rc.right - ctrlX - st->S(8);
-    int y = rc.top + st->S(4);
-    const int rowStep = st->S(kRowH) + st->S(kRowGap);
+    auto unit = [&](int page, RECT rc, const wchar_t* text) {
+        HWND h = CreateWindowExW(0, L"STATIC", text,
+            WS_CHILD | WS_VISIBLE | SS_CENTER | SS_CENTERIMAGE,
+            rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
+            hwnd, nullptr, InstOf(hwnd), nullptr);
+        if (h) st->pages[page].push_back(h);
+    };
+
+    auto edit = [&](int page, RECT slot, const wchar_t* text,
+                    DWORD style, int id) -> HWND {
+        st->chips[page].push_back(ChipSlot{nullptr, slot});
+        int ix = st->S(8);
+        int iy = st->S(3);
+        HWND h = CreateChild(st, page, L"EDIT", text,
+            WS_CHILD | WS_VISIBLE | style, 0,
+            slot.left + ix, slot.top + iy,
+            (slot.right - slot.left) - 2 * ix,
+            (slot.bottom - slot.top) - 2 * iy,
+            id, hwnd);
+        st->chips[page].back().child = h;
+        return h;
+    };
+
+    auto dropdown = [&](int page, RECT slot, DropdownKind kind,
+                        std::vector<std::wstring> items, int current) -> HWND {
+        if (items.empty()) items.push_back(L"");
+        if (current < 0 || current >= static_cast<int>(items.size())) current = 0;
+        HWND btn = CreateChild(st, page, L"BUTTON", items[current].c_str(),
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0,
+            slot.left, slot.top, slot.right - slot.left, slot.bottom - slot.top,
+            0, hwnd);
+        DropdownDef def;
+        def.trigger = btn;
+        def.kind = kind;
+        def.items = std::move(items);
+        def.current = current;
+        st->dropdowns.push_back(std::move(def));
+        return btn;
+    };
+
+    // 数字步进器：左侧 −，右侧 +，中间为可输入数值
+    auto stepper = [&](int page, RECT slot, const wchar_t* value, int id,
+                       int lo, int hi, DWORD editStyle) -> HWND {
+        st->chips[page].push_back(ChipSlot{nullptr, slot});
+        int pad = st->S(3);
+        int btnW = st->S(22);
+        int innerH = slot.bottom - slot.top - 2 * pad;
+        HWND minus = CreateChild(st, page, L"BUTTON", L"\u2212",
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0,
+            slot.left + pad, slot.top + pad, btnW, innerH,
+            IDC_BTN_STEP_MINUS, hwnd, false);
+        HWND plus = CreateChild(st, page, L"BUTTON", L"+",
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0,
+            slot.right - pad - btnW, slot.top + pad, btnW, innerH,
+            IDC_BTN_STEP_PLUS, hwnd, false);
+        int leftX = slot.left + pad + btnW + st->S(2);
+        int rightX = slot.right - pad - btnW - st->S(2);
+        HWND e = CreateChild(st, page, L"EDIT", value,
+            WS_CHILD | WS_VISIBLE | ES_CENTER | ES_AUTOHSCROLL | editStyle, 0,
+            leftX, slot.top + st->S(4), rightX - leftX,
+            (slot.bottom - slot.top) - st->S(8), id, hwnd);
+        st->chips[page].back().child = e;
+
+        NumberField nf;
+        nf.minus = minus;
+        nf.edit = e;
+        nf.plus = plus;
+        nf.lo = lo;
+        nf.hi = hi;
+        st->numbers.push_back(nf);
+        return e;
+    };
+
+    auto chipButton = [&](int page, RECT slot, const wchar_t* text,
+                          int id) -> HWND {
+        return CreateChild(st, page, L"BUTTON", text,
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0,
+            slot.left, slot.top, slot.right - slot.left, slot.bottom - slot.top,
+            id, hwnd);
+    };
+
+    auto divider = [&](int page, int rowY) {
+        st->rowDividerY[page].push_back(rowY + rowH + st->S(3));
+    };
+
+    auto intText = [](int v) {
+        wchar_t buf[32];
+        swprintf_s(buf, L"%d", v);
+        return std::wstring(buf);
+    };
 
     // ======================= 页 1：基本 =======================
-    CreateLabel(st, hwnd, L"\u5012\u8ba1\u65f6\u6807\u9898", rc.left, y, PageBasic);
-    st->hEditTitle = CreateChild(st, PageBasic, L"EDIT", st->cfg.title.c_str(),
-        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE,
-        ctrlX, y, ctrlW, st->S(kRowH), IDC_EDIT_TITLE, hwnd);
-    y += rowStep;
+    y = top;
+    {
+        const int page = PageBasic;
+        int rowY = y;
+        label(L"\u5012\u8ba1\u65f6\u6807\u9898", rowY, page);
+        st->hEditTitle = edit(page, makeSlots(rowY, {300})[0],
+                              st->cfg.title.c_str(), ES_AUTOHSCROLL,
+                              IDC_EDIT_TITLE);
+        divider(page, rowY); y += st->S(kRowStep);
 
-    CreateLabel(st, hwnd, L"\u76ee\u6807\u65f6\u95f4", rc.left, y, PageBasic);
-    st->hDtpDate = CreateChild(st, PageBasic, DATETIMEPICK_CLASSW, L"",
-        WS_CHILD | WS_VISIBLE | DTS_SHORTDATEFORMAT, 0,
-        ctrlX, y, st->S(170), st->S(kRowH), IDC_DTP_DATE, hwnd);
-    st->hDtpTime = CreateChild(st, PageBasic, DATETIMEPICK_CLASSW, L"",
-        WS_CHILD | WS_VISIBLE | DTS_TIMEFORMAT | DTS_UPDOWN, 0,
-        ctrlX + st->S(178), y, st->S(118), st->S(kRowH), IDC_DTP_TIME, hwnd);
+        rowY = y;
+        label(L"\u76ee\u6807\u65e5\u671f", rowY, page); // 目标日期
+        auto slots = makeSlots(rowY, {140, 34});
+        st->hEditDate = edit(page, slots[0],
+                             FormatDateText(st->cfg.targetTime).c_str(),
+                             ES_AUTOHSCROLL, IDC_DTP_DATE);
+        st->hBtnCalendar = chipButton(page, slots[1], L"", IDC_BTN_CALENDAR);
+        divider(page, rowY); y += st->S(kRowStep);
 
-    SYSTEMTIME stDate{}, stTime{};
-    TmToSystem(st->cfg.targetTime, stDate);
-    TmToSystem(st->cfg.targetTime, stTime);
-    DateTime_SetSystemtime(st->hDtpDate, GDT_VALID, &stDate);
-    DateTime_SetSystemtime(st->hDtpTime, GDT_VALID, &stTime);
-    y += rowStep;
+        rowY = y;
+        label(L"\u76ee\u6807\u65f6\u95f4", rowY, page); // 目标时间
+        st->hEditTime = edit(page, makeSlots(rowY, {110})[0],
+                             FormatClockText(st->cfg.targetTime).c_str(),
+                             ES_AUTOHSCROLL, IDC_DTP_TIME);
+        divider(page, rowY); y += st->S(kRowStep);
 
-    CreateLabel(st, hwnd, L"\u5faa\u73af", rc.left, y, PageBasic);
-    st->hCheckCycle = CreateChild(st, PageBasic, L"BUTTON",
-        L"\u5230\u671f\u540e\u81ea\u52a8\u5faa\u73af", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-        0, ctrlX, y, st->S(150), st->S(kRowH), IDC_CHECK_CYCLE, hwnd);
-    st->hComboCycle = CreateChild(st, PageBasic, L"COMBOBOX", L"",
-        WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 0,
-        ctrlX + st->S(158), y, st->S(110), st->S(160), IDC_COMBO_CYCLE, hwnd);
-    static const wchar_t* kCycles[] = {
-        L"\u5e74",   // 年
-        L"\u6708",   // 月
-        L"\u65e5",   // 日
-        L"\u65f6",   // 时
-        L"\u5206",   // 分
-        L"\u79d2",   // 秒
-    };
-    for (auto* s : kCycles) ComboBox_AddString(st->hComboCycle, s);
-    bool cycleOn = st->cfg.cycle != CycleUnit::None;
-    Button_SetCheck(st->hCheckCycle, cycleOn ? BST_CHECKED : BST_UNCHECKED);
-    if (cycleOn) {
-        ComboBox_SetCurSel(st->hComboCycle,
-                           static_cast<int>(st->cfg.cycle) - 1);
-    } else {
-        ComboBox_SetCurSel(st->hComboCycle, 0);
+        rowY = y;
+        label(L"\u5faa\u73af", rowY, page); // 循环
+        st->hBtnCycle = dropdown(page, makeSlots(rowY, {120})[0], DropCycle,
+                                 CycleItems(),
+                                 static_cast<int>(st->cfg.cycle));
+        divider(page, rowY); y += st->S(kRowStep);
+
+        rowY = y;
+        label(L"\u8d77\u59cb\u65e5\u8ba1\u5165", rowY, page); // 起始日计入
+        st->hBtnStart = chipButton(page, makeSlots(rowY, {64})[0], L"",
+                                   IDC_CHECK_INCLUDE_START);
+        divider(page, rowY); y += st->S(kRowStep);
     }
-    EnableWindow(st->hComboCycle, cycleOn ? TRUE : FALSE);
-    y += rowStep;
-
-    CreateLabel(st, hwnd, L"\u8d77\u59cb\u65e5", rc.left, y, PageBasic);
-    st->hCheckStart = CreateChild(st, PageBasic, L"BUTTON",
-        L"\u628a\u8d77\u59cb\u65e5\u8ba1\u5165\u5012\u8ba1\u65f6\uff08+1 \u5929\uff09",
-        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0,
-        ctrlX, y, ctrlW, st->S(kRowH), IDC_CHECK_INCLUDE_START, hwnd);
-    Button_SetCheck(st->hCheckStart,
-                    st->cfg.includeStartDay ? BST_CHECKED : BST_UNCHECKED);
 
     // ======================= 页 2：外观 =======================
-    y = rc.top + st->S(4);
-    CreateLabel(st, hwnd, L"\u663e\u793a\u683c\u5f0f", rc.left, y, PageAppearance);
-    st->hComboFmt = CreateChild(st, PageAppearance, L"COMBOBOX", L"",
-        WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 0,
-        ctrlX, y, st->S(230), st->S(140), IDC_COMBO_FORMAT, hwnd);
-    ComboBox_AddString(st->hComboFmt, L"\u65f6:\u5206:\u79d2");                 // 时:分:秒
-    ComboBox_AddString(st->hComboFmt, L"\u5e74\u6708\u65e5 \u65f6\u5206\u79d2"); // 年月日 时分秒
-    ComboBox_AddString(st->hComboFmt, L"\u5929\u6570 \u65f6:\u5206:\u79d2");     // 天数 时:分:秒
-    ComboBox_SetCurSel(st->hComboFmt,
-        st->cfg.displayFormat == utils::DisplayFormat::Full ? 1 :
-        st->cfg.displayFormat == utils::DisplayFormat::Days ? 2 : 0);
-    y += rowStep;
+    y = top;
+    {
+        const int page = PageAppearance;
+        int rowY = y;
+        label(L"\u663e\u793a\u683c\u5f0f", rowY, page); // 显示格式
+        st->hBtnFormat = dropdown(page, makeSlots(rowY, {170})[0], DropFormat,
+                                  FormatItems(),
+                                  static_cast<int>(st->cfg.displayFormat));
+        divider(page, rowY); y += st->S(kRowStep);
 
-    CreateLabel(st, hwnd, L"\u5b57\u53f7(\u50cf\u7d20)", rc.left, y, PageAppearance);
-    st->hEditSize = CreateChild(st, PageAppearance, L"EDIT", L"",
-        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_NUMBER, WS_EX_CLIENTEDGE,
-        ctrlX, y, st->S(80), st->S(kRowH), IDC_EDIT_FONTSIZE, hwnd);
-    st->hUdSize = CreateChild(st, PageAppearance, UPDOWN_CLASSW, L"",
-        WS_CHILD | WS_VISIBLE | UDS_SETBUDDYINT | UDS_ALIGNRIGHT
-            | UDS_AUTOBUDDY | UDS_ARROWKEYS, 0,
-        0, 0, 0, 0, IDC_UD_FONTSIZE, hwnd);
-    SendMessageW(st->hUdSize, UDM_SETRANGE32, 8, 200);
-    SendMessageW(st->hUdSize, UDM_SETPOS32, 0, st->cfg.fontSize);
-    y += rowStep;
+        rowY = y;
+        label(L"\u5b57\u53f7\uff08\u50cf\u7d20\uff09", rowY, page); // 字号（像素）
+        st->hEditSize = stepper(page, makeSlots(rowY, {110})[0],
+                                intText(st->cfg.fontSize).c_str(),
+                                IDC_EDIT_FONTSIZE, 8, 200, ES_NUMBER);
+        divider(page, rowY); y += st->S(kRowStep);
 
-    CreateLabel(st, hwnd, L"\u5b57\u4f53", rc.left, y, PageAppearance);
-    st->hComboFont = CreateChild(st, PageAppearance, L"COMBOBOX", L"",
-        WS_CHILD | WS_VISIBLE | CBS_DROPDOWN | CBS_AUTOHSCROLL | WS_VSCROLL, 0,
-        ctrlX, y, ctrlW, st->S(260), IDC_COMBO_FONT, hwnd);
-
-    auto fonts = utils::EnumerateSystemFonts();
-    int sel = -1;
-    for (size_t i = 0; i < fonts.size(); ++i) {
-        ComboBox_AddString(st->hComboFont, fonts[i].c_str());
-        if (fonts[i] == st->cfg.font) sel = static_cast<int>(i);
-    }
-    if (sel >= 0) {
-        ComboBox_SetCurSel(st->hComboFont, sel);
-    } else if (!fonts.empty()) {
-        ComboBox_SetCurSel(st->hComboFont, 0);
-    } else {
-        ComboBox_AddString(st->hComboFont, st->cfg.font.c_str());
-        ComboBox_SetCurSel(st->hComboFont, 0);
+        rowY = y;
+        label(L"\u5b57\u4f53", rowY, page); // 字体
+        if (st->cfg.font.empty()) {
+            st->cfg.font = utils::GetSystemDefaultFontName();
+        }
+        auto fonts = utils::EnumerateSystemFonts();
+        if (fonts.empty()) fonts.push_back(st->cfg.font);
+        int fontIdx = -1;
+        for (size_t i = 0; i < fonts.size(); ++i) {
+            if (fonts[i] == st->cfg.font) {
+                fontIdx = static_cast<int>(i);
+                break;
+            }
+        }
+        if (fontIdx < 0) {
+            // 配置里的字体不在系统列表（例如从别处拷来的配置）：
+            // 保留它并插到第一项，保证下拉显示与配置一致
+            fonts.insert(fonts.begin(), st->cfg.font);
+            fontIdx = 0;
+        }
+        dropdown(page, makeSlots(rowY, {280})[0], DropFont,
+                 std::move(fonts), fontIdx);
+        divider(page, rowY); y += st->S(kRowStep);
     }
 
     // ======================= 页 3：一言 =======================
-    y = rc.top + st->S(4);
-    CreateLabel(st, hwnd, L"\u4e00\u8a00\u6765\u6e90", rc.left, y, PageHitokoto);
-    st->hComboHkSrc = CreateChild(st, PageHitokoto, L"COMBOBOX", L"",
-        WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 0,
-        ctrlX, y, st->S(200), st->S(120), IDC_COMBO_HITOKOTO_SRC, hwnd);
-    ComboBox_AddString(st->hComboHkSrc, L"\u672c\u5730");           // 本地
-    ComboBox_AddString(st->hComboHkSrc, L"\u7f51\u7edc");           // 网络
-    ComboBox_AddString(st->hComboHkSrc, L"\u672c\u5730\u548c\u7f51\u7edc"); // 本地和网络
-    ComboBox_SetCurSel(st->hComboHkSrc, static_cast<int>(st->cfg.hitokotoSource));
-    y += rowStep;
+    y = top;
+    {
+        const int page = PageHitokoto;
+        int rowY = y;
+        label(L"\u4e00\u8a00\u6765\u6e90", rowY, page); // 一言来源
+        st->hBtnHkSrc = dropdown(page, makeSlots(rowY, {120})[0], DropSource,
+                                 SourceItems(),
+                                 static_cast<int>(st->cfg.hitokotoSource));
+        divider(page, rowY); y += st->S(kRowStep);
 
-    CreateLabel(st, hwnd, L"\u5237\u65b0\u65f6\u95f4(\u79d2)", rc.left, y, PageHitokoto);
-    st->hEditHkRefresh = CreateChild(st, PageHitokoto, L"EDIT", L"",
-        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_NUMBER, WS_EX_CLIENTEDGE,
-        ctrlX, y, st->S(80), st->S(kRowH), IDC_EDIT_HITOKOTO_REFRESH, hwnd);
-    st->hUdHkRefresh = CreateChild(st, PageHitokoto, UPDOWN_CLASSW, L"",
-        WS_CHILD | WS_VISIBLE | UDS_SETBUDDYINT | UDS_ALIGNRIGHT
-            | UDS_AUTOBUDDY | UDS_ARROWKEYS, 0,
-        0, 0, 0, 0, IDC_UD_HITOKOTO_REFRESH, hwnd);
-    SendMessageW(st->hUdHkRefresh, UDM_SETRANGE32, 5, 3600);
-    SendMessageW(st->hUdHkRefresh, UDM_SETPOS32, 0, st->cfg.hitokotoRefreshSec);
+        rowY = y;
+        label(L"\u5237\u65b0\u65f6\u95f4\uff08\u79d2\uff09", rowY, page); // 刷新时间（秒）
+        st->hEditHkRefresh = stepper(page, makeSlots(rowY, {116})[0],
+                                     intText(st->cfg.hitokotoRefreshSec).c_str(),
+                                     IDC_EDIT_HITOKOTO_REFRESH,
+                                     5, 3600, ES_NUMBER);
+        divider(page, rowY); y += st->S(kRowStep);
+    }
 
     // ======================= 页 4：一文 =======================
-    y = rc.top + st->S(4);
-    CreateLabel(st, hwnd, L"\u680f\u76ee", rc.left, y, PageArticle);
-    st->hCheckArticle = CreateChild(st, PageArticle, L"BUTTON",
-        L"\u663e\u793a\u4e00\u6587\u680f\u76ee", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-        0, ctrlX, y, ctrlW, st->S(kRowH), IDC_CHECK_ARTICLE, hwnd);
-    Button_SetCheck(st->hCheckArticle,
-                    st->cfg.articleEnabled ? BST_CHECKED : BST_UNCHECKED);
-    y += rowStep;
+    y = top;
+    {
+        const int page = PageArticle;
+        int rowY = y;
+        label(L"\u680f\u76ee", rowY, page); // 栏目
+        st->hBtnArticle = chipButton(page, makeSlots(rowY, {64})[0], L"",
+                                     IDC_CHECK_ARTICLE);
+        divider(page, rowY); y += st->S(kRowStep);
 
-    CreateLabel(st, hwnd, L"\u7a97\u53e3\u4f4d\u7f6e", rc.left, y, PageArticle);
-    st->hComboArtAnchor = CreateChild(st, PageArticle, L"COMBOBOX", L"",
-        WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 0,
-        ctrlX, y, st->S(180), st->S(220), IDC_COMBO_ARTICLE_ANCHOR, hwnd);
-    static const wchar_t* kArticleAnchors[] = {
-        L"\u5de6\u4e0a\u89d2",   L"\u9876\u90e8\u5c45\u4e2d", L"\u53f3\u4e0a\u89d2",
-        L"\u5de6\u5c45\u4e2d",   L"\u5c4f\u5e55\u5c45\u4e2d", L"\u53f3\u5c45\u4e2d",
-        L"\u5de6\u4e0b\u89d2",   L"\u5e95\u90e8\u5c45\u4e2d", L"\u53f3\u4e0b\u89d2",
-    };
-    for (auto* s : kArticleAnchors) ComboBox_AddString(st->hComboArtAnchor, s);
-    ComboBox_SetCurSel(st->hComboArtAnchor, static_cast<int>(st->cfg.articleAnchor));
-    y += rowStep;
+        rowY = y;
+        label(L"\u7a97\u53e3\u4f4d\u7f6e", rowY, page); // 窗口位置
+        st->hBtnArtAnchor = dropdown(page, makeSlots(rowY, {140})[0],
+                                     DropArtAnchor, AnchorItems(),
+                                     static_cast<int>(st->cfg.articleAnchor));
+        divider(page, rowY); y += st->S(kRowStep);
 
-    CreateLabel(st, hwnd, L"\u504f\u79fb(\u50cf\u7d20)", rc.left, y, PageArticle);
-    st->hEditArtX = CreateChild(st, PageArticle, L"EDIT", L"",
-        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE,
-        ctrlX, y, st->S(64), st->S(kRowH), IDC_EDIT_ARTICLE_X, hwnd);
-    CreateChild(st, PageArticle, L"STATIC", L"X", WS_CHILD | WS_VISIBLE | SS_CENTER,
-        0, ctrlX + st->S(70), y, st->S(18), st->S(kRowH), 0, hwnd);
-    st->hEditArtY = CreateChild(st, PageArticle, L"EDIT", L"",
-        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE,
-        ctrlX + st->S(94), y, st->S(64), st->S(kRowH), IDC_EDIT_ARTICLE_Y, hwnd);
-    CreateChild(st, PageArticle, L"STATIC", L"Y", WS_CHILD | WS_VISIBLE | SS_CENTER,
-        0, ctrlX + st->S(164), y, st->S(18), st->S(kRowH), 0, hwnd);
-    wchar_t ab[32];
-    swprintf_s(ab, L"%d", st->cfg.articlePlaceX);
-    SetWindowTextW(st->hEditArtX, ab);
-    swprintf_s(ab, L"%d", st->cfg.articlePlaceY);
-    SetWindowTextW(st->hEditArtY, ab);
-    y += rowStep;
+        rowY = y;
+        label(L"\u504f\u79fb\uff08\u50cf\u7d20\uff09", rowY, page); // 偏移（像素）
+        auto slots = makeSlots(rowY, {116, 14, 116, 14});
+        st->hEditArtX = stepper(page, slots[0],
+                                intText(st->cfg.articlePlaceX).c_str(),
+                                IDC_EDIT_ARTICLE_X, -10000, 10000,
+                                ES_AUTOHSCROLL);
+        unit(page, slots[1], L"X");
+        st->hEditArtY = stepper(page, slots[2],
+                                intText(st->cfg.articlePlaceY).c_str(),
+                                IDC_EDIT_ARTICLE_Y, -10000, 10000,
+                                ES_AUTOHSCROLL);
+        unit(page, slots[3], L"Y");
+        divider(page, rowY); y += st->S(kRowStep);
 
-    CreateLabel(st, hwnd, L"\u5237\u65b0\u65f6\u95f4", rc.left, y, PageArticle);
-    int totalSec = st->cfg.articleRefreshSec;
-    int artH = totalSec / 3600;
-    int artM = (totalSec / 60) % 60;
-    int artS = totalSec % 60;
+        rowY = y;
+        label(L"\u5237\u65b0\u65f6\u95f4", rowY, page); // 刷新时间
+        int totalSec = st->cfg.articleRefreshSec;
+        int artH = totalSec / 3600;
+        int artM = (totalSec / 60) % 60;
+        int artS = totalSec % 60;
+        slots = makeSlots(rowY, {90, 14, 90, 14, 90, 14});
+        st->hEditArtH = stepper(page, slots[0], intText(artH).c_str(),
+                                IDC_EDIT_ARTICLE_H, 0, 23, ES_NUMBER);
+        unit(page, slots[1], L"\u65f6"); // 时
+        st->hEditArtM = stepper(page, slots[2], intText(artM).c_str(),
+                                IDC_EDIT_ARTICLE_M, 0, 59, ES_NUMBER);
+        unit(page, slots[3], L"\u5206"); // 分
+        st->hEditArtS = stepper(page, slots[4], intText(artS).c_str(),
+                                IDC_EDIT_ARTICLE_S, 0, 59, ES_NUMBER);
+        unit(page, slots[5], L"\u79d2"); // 秒
+        divider(page, rowY); y += st->S(kRowStep);
 
-    st->hEditArtH = CreateChild(st, PageArticle, L"EDIT", L"",
-        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_NUMBER, WS_EX_CLIENTEDGE,
-        ctrlX, y, st->S(56), st->S(kRowH), IDC_EDIT_ARTICLE_H, hwnd);
-    st->hUdArtH = CreateChild(st, PageArticle, UPDOWN_CLASSW, L"",
-        WS_CHILD | WS_VISIBLE | UDS_SETBUDDYINT | UDS_ALIGNRIGHT
-            | UDS_AUTOBUDDY | UDS_ARROWKEYS, 0,
-        0, 0, 0, 0, IDC_UD_ARTICLE_H, hwnd);
-    SendMessageW(st->hUdArtH, UDM_SETRANGE32, 0, 23);
-    SendMessageW(st->hUdArtH, UDM_SETPOS32, 0, artH);
-    CreateChild(st, PageArticle, L"STATIC", L"\u65f6", WS_CHILD | WS_VISIBLE,
-        0, ctrlX + st->S(60), y, st->S(20), st->S(kRowH), 0, hwnd);
+        rowY = y;
+        label(L"\u59cb\u7ec8\u7f6e\u9876", rowY, page); // 始终置顶
+        st->hBtnArtTop = chipButton(page, makeSlots(rowY, {64})[0], L"",
+                                    IDC_CHECK_ARTICLE_TOP);
+        divider(page, rowY); y += st->S(kRowStep);
 
-    st->hEditArtM = CreateChild(st, PageArticle, L"EDIT", L"",
-        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_NUMBER, WS_EX_CLIENTEDGE,
-        ctrlX + st->S(84), y, st->S(56), st->S(kRowH), IDC_EDIT_ARTICLE_M, hwnd);
-    st->hUdArtM = CreateChild(st, PageArticle, UPDOWN_CLASSW, L"",
-        WS_CHILD | WS_VISIBLE | UDS_SETBUDDYINT | UDS_ALIGNRIGHT
-            | UDS_AUTOBUDDY | UDS_ARROWKEYS, 0,
-        0, 0, 0, 0, IDC_UD_ARTICLE_M, hwnd);
-    SendMessageW(st->hUdArtM, UDM_SETRANGE32, 0, 59);
-    SendMessageW(st->hUdArtM, UDM_SETPOS32, 0, artM);
-    CreateChild(st, PageArticle, L"STATIC", L"\u5206", WS_CHILD | WS_VISIBLE,
-        0, ctrlX + st->S(144), y, st->S(20), st->S(kRowH), 0, hwnd);
+        rowY = y;
+        label(L"\u6b63\u6587\u5b57\u53f7", rowY, page); // 正文字号
+        st->hEditArtFont = stepper(page, makeSlots(rowY, {110})[0],
+                                   intText(st->cfg.articleFontSize).c_str(),
+                                   IDC_EDIT_ARTICLE_FONT, 8, 96, ES_NUMBER);
+        divider(page, rowY); y += st->S(kRowStep);
 
-    st->hEditArtS = CreateChild(st, PageArticle, L"EDIT", L"",
-        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_NUMBER, WS_EX_CLIENTEDGE,
-        ctrlX + st->S(168), y, st->S(56), st->S(kRowH), IDC_EDIT_ARTICLE_S, hwnd);
-    st->hUdArtS = CreateChild(st, PageArticle, UPDOWN_CLASSW, L"",
-        WS_CHILD | WS_VISIBLE | UDS_SETBUDDYINT | UDS_ALIGNRIGHT
-            | UDS_AUTOBUDDY | UDS_ARROWKEYS, 0,
-        0, 0, 0, 0, IDC_UD_ARTICLE_S, hwnd);
-    SendMessageW(st->hUdArtS, UDM_SETRANGE32, 0, 59);
-    SendMessageW(st->hUdArtS, UDM_SETPOS32, 0, artS);
-    CreateChild(st, PageArticle, L"STATIC", L"\u79d2", WS_CHILD | WS_VISIBLE,
-        0, ctrlX + st->S(228), y, st->S(20), st->S(kRowH), 0, hwnd);
-    y += rowStep;
+        rowY = y;
+        label(L"\u5c3a\u5bf8\u6a21\u5f0f", rowY, page); // 尺寸模式
+        st->hBtnArtSize = dropdown(page, makeSlots(rowY, {180})[0],
+                                   DropArtSize, ArticleSizeItems(),
+                                   static_cast<int>(st->cfg.articleSizeMode));
+        divider(page, rowY); y += st->S(kRowStep);
 
-    CreateLabel(st, hwnd, L"\u7f6e\u9876", rc.left, y, PageArticle);
-    st->hCheckArtTop = CreateChild(st, PageArticle, L"BUTTON",
-        L"\u4e00\u6587\u59cb\u7ec8\u7f6e\u9876", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-        0, ctrlX, y, ctrlW, st->S(kRowH), IDC_CHECK_ARTICLE_TOP, hwnd);
-    Button_SetCheck(st->hCheckArtTop,
-                    st->cfg.articleIsTop ? BST_CHECKED : BST_UNCHECKED);
-    y += rowStep;
-
-    CreateLabel(st, hwnd, L"\u5b57\u53f7(\u50cf\u7d20)", rc.left, y, PageArticle);
-    st->hEditArtFont = CreateChild(st, PageArticle, L"EDIT", L"",
-        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_NUMBER, WS_EX_CLIENTEDGE,
-        ctrlX, y, st->S(56), st->S(kRowH), IDC_EDIT_ARTICLE_FONT, hwnd);
-    st->hUdArtFont = CreateChild(st, PageArticle, UPDOWN_CLASSW, L"",
-        WS_CHILD | WS_VISIBLE | UDS_SETBUDDYINT | UDS_ALIGNRIGHT
-            | UDS_AUTOBUDDY | UDS_ARROWKEYS, 0,
-        0, 0, 0, 0, IDC_UD_ARTICLE_FONT, hwnd);
-    SendMessageW(st->hUdArtFont, UDM_SETRANGE32, 8, 96);
-    SendMessageW(st->hUdArtFont, UDM_SETPOS32, 0, st->cfg.articleFontSize);
-    y += rowStep;
-
-    CreateLabel(st, hwnd, L"\u5c3a\u5bf8\u6a21\u5f0f", rc.left, y, PageArticle);
-    st->hComboArtSize = CreateChild(st, PageArticle, L"COMBOBOX", L"",
-        WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 0,
-        ctrlX, y, st->S(240), st->S(160), IDC_COMBO_ARTICLE_SIZE_MODE, hwnd);
-    ComboBox_AddString(st->hComboArtSize, L"\u81ea\u9002\u5e94\uff08\u56fa\u5b9a\u5bbd\uff09");
-    ComboBox_AddString(st->hComboArtSize, L"\u81ea\u9002\u5e94\u8c03\u6574\uff08\u5168\u81ea\u9002\u5e94\uff09");
-    ComboBox_AddString(st->hComboArtSize, L"\u81ea\u5b9a\u4e49");
-    ComboBox_SetCurSel(st->hComboArtSize,
-                       static_cast<int>(st->cfg.articleSizeMode));
-    y += rowStep;
-
-    CreateLabel(st, hwnd, L"\u5c3a\u5bf8(\u50cf\u7d20)", rc.left, y, PageArticle);
-    st->hEditArtWidth = CreateChild(st, PageArticle, L"EDIT", L"",
-        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_NUMBER, WS_EX_CLIENTEDGE,
-        ctrlX, y, st->S(64), st->S(kRowH), IDC_EDIT_ARTICLE_WIDTH, hwnd);
-    CreateChild(st, PageArticle, L"STATIC", L"\u5bbd", WS_CHILD | WS_VISIBLE,
-        0, ctrlX + st->S(70), y, st->S(20), st->S(kRowH), 0, hwnd);
-    st->hEditArtHeight = CreateChild(st, PageArticle, L"EDIT", L"",
-        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_NUMBER, WS_EX_CLIENTEDGE,
-        ctrlX + st->S(94), y, st->S(64), st->S(kRowH), IDC_EDIT_ARTICLE_HEIGHT, hwnd);
-    CreateChild(st, PageArticle, L"STATIC", L"\u9ad8", WS_CHILD | WS_VISIBLE,
-        0, ctrlX + st->S(164), y, st->S(20), st->S(kRowH), 0, hwnd);
-    wchar_t szbuf[32];
-    swprintf_s(szbuf, L"%d", st->cfg.articleWidth);
-    SetWindowTextW(st->hEditArtWidth, szbuf);
-    swprintf_s(szbuf, L"%d", st->cfg.articleHeight);
-    SetWindowTextW(st->hEditArtHeight, szbuf);
-    UpdateArticleSizeControls(st);
+        rowY = y;
+        label(L"\u5c3a\u5bf8\uff08\u50cf\u7d20\uff09", rowY, page); // 尺寸（像素）
+        slots = makeSlots(rowY, {116, 14, 116, 14});
+        st->hEditArtWidth = stepper(page, slots[0],
+                                    intText(st->cfg.articleWidth).c_str(),
+                                    IDC_EDIT_ARTICLE_WIDTH, 180, 1200,
+                                    ES_NUMBER);
+        unit(page, slots[1], L"\u5bbd"); // 宽
+        st->hEditArtHeight = stepper(page, slots[2],
+                                     intText(st->cfg.articleHeight).c_str(),
+                                     IDC_EDIT_ARTICLE_HEIGHT, 120, 2000,
+                                     ES_NUMBER);
+        unit(page, slots[3], L"\u9ad8"); // 高
+        divider(page, rowY); y += st->S(kRowStep);
+    }
 
     // ======================= 页 5：窗口与启动 =======================
-    y = rc.top + st->S(4);
-    CreateLabel(st, hwnd, L"\u7a97\u53e3\u4f4d\u7f6e", rc.left, y, PageWindow);
-    st->hComboAnchor = CreateChild(st, PageWindow, L"COMBOBOX", L"",
-        WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 0,
-        ctrlX, y, st->S(180), st->S(220), IDC_COMBO_ANCHOR, hwnd);
-    // 顺序与 WindowAnchor 枚举一致
-    static const wchar_t* kAnchors[] = {
-        L"\u5de6\u4e0a\u89d2",   L"\u9876\u90e8\u5c45\u4e2d", L"\u53f3\u4e0a\u89d2",
-        L"\u5de6\u5c45\u4e2d",   L"\u5c4f\u5e55\u5c45\u4e2d", L"\u53f3\u5c45\u4e2d",
-        L"\u5de6\u4e0b\u89d2",   L"\u5e95\u90e8\u5c45\u4e2d", L"\u53f3\u4e0b\u89d2",
-    };
-    for (auto* s : kAnchors) ComboBox_AddString(st->hComboAnchor, s);
-    ComboBox_SetCurSel(st->hComboAnchor, static_cast<int>(st->cfg.anchor));
-    y += rowStep;
+    y = top;
+    {
+        const int page = PageWindow;
+        int rowY = y;
+        label(L"\u7a97\u53e3\u4f4d\u7f6e", rowY, page); // 窗口位置
+        st->hBtnAnchor = dropdown(page, makeSlots(rowY, {140})[0],
+                                  DropWinAnchor, AnchorItems(),
+                                  static_cast<int>(st->cfg.anchor));
+        divider(page, rowY); y += st->S(kRowStep);
 
-    CreateLabel(st, hwnd, L"\u504f\u79fb(\u50cf\u7d20)", rc.left, y, PageWindow);
-    st->hEditPlaceX = CreateChild(st, PageWindow, L"EDIT", L"",
-        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE,
-        ctrlX, y, st->S(64), st->S(kRowH), IDC_EDIT_PLACE_X, hwnd);
-    CreateChild(st, PageWindow, L"STATIC", L"X", WS_CHILD | WS_VISIBLE | SS_CENTER,
-        0, ctrlX + st->S(70), y, st->S(18), st->S(kRowH), 0, hwnd);
-    st->hEditPlaceY = CreateChild(st, PageWindow, L"EDIT", L"",
-        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE,
-        ctrlX + st->S(94), y, st->S(64), st->S(kRowH), IDC_EDIT_PLACE_Y, hwnd);
-    CreateChild(st, PageWindow, L"STATIC", L"Y", WS_CHILD | WS_VISIBLE | SS_CENTER,
-        0, ctrlX + st->S(164), y, st->S(18), st->S(kRowH), 0, hwnd);
-    wchar_t nb[32];
-    swprintf_s(nb, L"%d", st->cfg.placeX);
-    SetWindowTextW(st->hEditPlaceX, nb);
-    swprintf_s(nb, L"%d", st->cfg.placeY);
-    SetWindowTextW(st->hEditPlaceY, nb);
-    y += rowStep;
+        rowY = y;
+        label(L"\u504f\u79fb\uff08\u50cf\u7d20\uff09", rowY, page); // 偏移（像素）
+        auto slots = makeSlots(rowY, {116, 14, 116, 14});
+        st->hEditPlaceX = stepper(page, slots[0],
+                                  intText(st->cfg.placeX).c_str(),
+                                  IDC_EDIT_PLACE_X, -10000, 10000,
+                                  ES_AUTOHSCROLL);
+        unit(page, slots[1], L"X");
+        st->hEditPlaceY = stepper(page, slots[2],
+                                  intText(st->cfg.placeY).c_str(),
+                                  IDC_EDIT_PLACE_Y, -10000, 10000,
+                                  ES_AUTOHSCROLL);
+        unit(page, slots[3], L"Y");
+        divider(page, rowY); y += st->S(kRowStep);
 
-    CreateLabel(st, hwnd, L"\u7a97\u53e3\u884c\u4e3a", rc.left, y, PageWindow);
-    st->hCheckTop = CreateChild(st, PageWindow, L"BUTTON", L"\u59cb\u7ec8\u7f6e\u9876",
-        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0,
-        ctrlX, y, st->S(140), st->S(kRowH), IDC_CHECK_TOPMOST, hwnd);
-    Button_SetCheck(st->hCheckTop, st->cfg.isTop ? BST_CHECKED : BST_UNCHECKED);
-    y += rowStep;
+        rowY = y;
+        label(L"\u59cb\u7ec8\u7f6e\u9876", rowY, page); // 始终置顶
+        st->hBtnTop = chipButton(page, makeSlots(rowY, {64})[0], L"",
+                                 IDC_CHECK_TOPMOST);
+        divider(page, rowY); y += st->S(kRowStep);
 
-    CreateLabel(st, hwnd, L"\u5f00\u673a\u542f\u52a8", rc.left, y, PageWindow);
-    st->hCheckAuto = CreateChild(st, PageWindow, L"BUTTON", L"\u5f00\u673a\u81ea\u52a8\u542f\u52a8",
-        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0,
-        ctrlX, y, ctrlW, st->S(kRowH), IDC_CHECK_AUTOSTART, hwnd);
-    Button_SetCheck(st->hCheckAuto, st->cfg.autoStart ? BST_CHECKED : BST_UNCHECKED);
+        rowY = y;
+        label(L"\u5f00\u673a\u81ea\u542f\u52a8", rowY, page); // 开机自启动
+        st->hBtnAuto = chipButton(page, makeSlots(rowY, {64})[0], L"",
+                                  IDC_CHECK_AUTOSTART);
+        divider(page, rowY); y += st->S(kRowStep);
+    }
 
-    // ======================= 底部按钮与制作者信息 =======================
-    int btnW = st->S(92), btnH = st->S(28);
-    int btnY = st->S(kWinH - kPadding - 28 - 24);
-    int bx = st->S(kWinW - kPadding) - btnW;
-    CreateWindowW(L"BUTTON", L"\u53d6\u6d88", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                  bx, btnY, btnW, btnH, hwnd, (HMENU)IDC_BTN_CANCEL, hInst, nullptr);
-    bx -= (btnW + st->S(8));
-    CreateWindowW(L"BUTTON", L"\u4fdd\u5b58", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-                  bx, btnY, btnW, btnH, hwnd, (HMENU)IDC_BTN_SAVE, hInst, nullptr);
-
-    CreateWindowW(L"STATIC",
-        L"\u5236\u4f5c\uff1aBu Xin    \u90ae\u7bb1\uff1abuxin0912@qq.com",
-        WS_CHILD | WS_VISIBLE | SS_CENTER,
-        st->S(kPadding), st->S(kWinH - kPadding - 16),
-        st->S(kWinW - 2 * kPadding), st->S(16),
-        hwnd, (HMENU)IDC_STATIC_CREDIT, hInst, nullptr);
+    // ======================= 底部按钮 =======================
+    int btnY = cr.bottom - st->S(kPad) - st->S(kBtnH);
+    int bx = cr.right - st->S(kPad) - st->S(kBtnW);
+    st->hBtnSave = CreateWindowExW(0, L"BUTTON", L"\u4fdd\u5b58",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+        bx, btnY, st->S(kBtnW), st->S(kBtnH), hwnd,
+        (HMENU)(INT_PTR)IDC_BTN_SAVE, InstOf(hwnd), nullptr);
+    bx -= st->S(kBtnW) + st->S(12);
+    st->hBtnCancel = CreateWindowExW(0, L"BUTTON", L"\u53d6\u6d88",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+        bx, btnY, st->S(kBtnW), st->S(kBtnH), hwnd,
+        (HMENU)(INT_PTR)IDC_BTN_CANCEL, InstOf(hwnd), nullptr);
 
     // 统一字体
     EnumChildWindows(hwnd, [](HWND child, LPARAM lp) -> BOOL {
@@ -553,9 +1418,9 @@ static void OnCreate(HWND hwnd, SettingsState* st) {
         return TRUE;
     }, (LPARAM)st->font);
 
-    ShowPage(st, 0);
+    ShowPage(st, PageBasic);
     SetFocus(st->hEditTitle);
-    Edit_SetSel(st->hEditTitle, 0, 0);
+    SendMessageW(st->hEditTitle, EM_SETSEL, 0, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -570,95 +1435,51 @@ static bool CollectAndValidate(HWND hwnd, SettingsState* st) {
     if (st->cfg.title.empty()) {
         MessageBoxW(hwnd, L"\u6807\u9898\u4e0d\u80fd\u4e3a\u7a7a",
                     L"\u63d0\u793a", MB_ICONWARNING);
-        TabCtrl_SetCurSel(st->hTab, PageBasic);
         ShowPage(st, PageBasic);
         SetFocus(st->hEditTitle);
         return false;
     }
 
-    // 目标时间
-    SYSTEMTIME sd{}, stTime{};
-    if (DateTime_GetSystemtime(st->hDtpDate, &sd) != GDT_VALID
-        || DateTime_GetSystemtime(st->hDtpTime, &stTime) != GDT_VALID) {
-        MessageBoxW(hwnd, L"\u65f6\u95f4\u683c\u5f0f\u65e0\u6548",
-                    L"\u63d0\u793a", MB_ICONWARNING);
+    // 目标时间：日期 + 时间文本合并后严格解析
+    wchar_t dateBuf[64] = {0};
+    wchar_t clockBuf[64] = {0};
+    GetWindowTextW(st->hEditDate, dateBuf, 64);
+    GetWindowTextW(st->hEditTime, clockBuf, 64);
+    std::wstring full = std::wstring(dateBuf) + L" " + clockBuf;
+    std::tm target{};
+    if (!utils::ParseTargetTime(full, target)) {
+        MessageBoxW(hwnd,
+            L"\u76ee\u6807\u65f6\u95f4\u683c\u5f0f\u65e0\u6548"
+            L"\uff08\u65e5\u671f YYYY-MM-DD\uff0c\u65f6\u95f4 HH:MM:SS\uff09",
+            L"\u63d0\u793a", MB_ICONWARNING);
+        ShowPage(st, PageBasic);
+        SetFocus(st->hEditDate);
         return false;
     }
-    sd.wHour = stTime.wHour;
-    sd.wMinute = stTime.wMinute;
-    sd.wSecond = stTime.wSecond;
-    SystemToTm(sd, st->cfg.targetTime);
+    st->cfg.targetTime = target;
 
-    // 循环
-    bool cycleOn = (Button_GetCheck(st->hCheckCycle) == BST_CHECKED);
-    if (cycleOn) {
-        int cycSel = ComboBox_GetCurSel(st->hComboCycle);
-        if (cycSel < 0 || cycSel > 5) {
-            MessageBoxW(hwnd, L"\u8bf7\u9009\u62e9\u5faa\u73af\u5468\u671f",
-                        L"\u63d0\u793a", MB_ICONWARNING);
-            TabCtrl_SetCurSel(st->hTab, PageBasic);
-            ShowPage(st, PageBasic);
-            SetFocus(st->hComboCycle);
-            return false;
-        }
-        st->cfg.cycle = static_cast<CycleUnit>(cycSel + 1);
-    } else {
-        st->cfg.cycle = CycleUnit::None;
-    }
-
-    // 起始日
-    st->cfg.includeStartDay =
-        (Button_GetCheck(st->hCheckStart) == BST_CHECKED);
-
-    // 显示格式
-    int fmtSel = ComboBox_GetCurSel(st->hComboFmt);
-    st->cfg.displayFormat = (fmtSel == 1) ? utils::DisplayFormat::Full
-                          : (fmtSel == 2) ? utils::DisplayFormat::Days
-                                          : utils::DisplayFormat::HMS;
+    // 循环/显示格式/一言来源/位置/尺寸模式：点击时装已写入 cfg
+    st->cfg.includeStartDay = st->optStart;
 
     // 字号
-    // UDM_GETPOS32 的 lParam 指向 BOOL 错误标志：0=成功，非0=错误
-    BOOL error = FALSE;
-    int size = static_cast<int>(SendMessageW(st->hUdSize, UDM_GETPOS32, 0,
-                          reinterpret_cast<LPARAM>(&error)));
-    if (error || size < 8 || size > 200) {
+    int size = 0;
+    if (!ParseIntField(st->hEditSize, size) || size < 8 || size > 200) {
         MessageBoxW(hwnd, L"\u5b57\u53f7\u5e94\u5728 8\u2013200 \u4e4b\u95f4",
                     L"\u63d0\u793a", MB_ICONWARNING);
-        TabCtrl_SetCurSel(st->hTab, PageAppearance);
         ShowPage(st, PageAppearance);
         SetFocus(st->hEditSize);
         return false;
     }
     st->cfg.fontSize = size;
 
-    // 字体：从组合框列表获取选中项文本。
-    // 注意不能用 GetWindowTextW —— CBS_DROPDOWN 的编辑框部分经 WM_SETFONT
-    // 重建后文本不可靠；且 CB_GETLBTEXT 不写 null 终止符，必须用返回长度构造。
-    int fontSel = ComboBox_GetCurSel(st->hComboFont);
-    int n = 0;
-    if (fontSel != CB_ERR) {
-        n = ComboBox_GetLBTextLen(st->hComboFont, fontSel);
-        if (n > 0 && n < 256) {
-            ComboBox_GetLBText(st->hComboFont, fontSel, buf);
-            st->cfg.font.assign(buf, n);
-        }
-    }
+    // 字体：由下拉列表直接写入 cfg，这里只兜底默认值
     if (st->cfg.font.empty()) st->cfg.font = utils::GetSystemDefaultFontName();
 
-    // 一言来源
-    int hkSel = ComboBox_GetCurSel(st->hComboHkSrc);
-    st->cfg.hitokotoSource = (hkSel == 0) ? HitokotoSource::Local
-                          : (hkSel == 1) ? HitokotoSource::Network
-                                         : HitokotoSource::Both;
-
-    // 一言刷新时间（秒）
-    BOOL err2 = FALSE;
-    int sec = static_cast<int>(SendMessageW(st->hUdHkRefresh, UDM_GETPOS32, 0,
-                            reinterpret_cast<LPARAM>(&err2)));
-    if (err2 || sec < 5 || sec > 3600) {
+    // 一言刷新时间
+    int sec = 0;
+    if (!ParseIntField(st->hEditHkRefresh, sec) || sec < 5 || sec > 3600) {
         MessageBoxW(hwnd, L"\u5237\u65b0\u65f6\u95f4\u5e94\u5728 5\u20133600 \u4e4b\u95f4",
                     L"\u63d0\u793a", MB_ICONWARNING);
-        TabCtrl_SetCurSel(st->hTab, PageHitokoto);
         ShowPage(st, PageHitokoto);
         SetFocus(st->hEditHkRefresh);
         return false;
@@ -666,27 +1487,20 @@ static bool CollectAndValidate(HWND hwnd, SettingsState* st) {
     st->cfg.hitokotoRefreshSec = sec;
 
     // 一文栏目
-    st->cfg.articleEnabled = (Button_GetCheck(st->hCheckArticle) == BST_CHECKED);
+    st->cfg.articleEnabled = st->optArticle;
 
-    int artAnchorSel = ComboBox_GetCurSel(st->hComboArtAnchor);
-    if (artAnchorSel < 0 || artAnchorSel > 8) {
-        MessageBoxW(hwnd, L"\u8bf7\u9009\u62e9\u4e00\u6587\u7a97\u53e3\u4f4d\u7f6e",
+    // 一文偏移
+    int artX = 0, artY = 0;
+    if (!ParseIntField(st->hEditArtX, artX) || !ParseIntField(st->hEditArtY, artY)) {
+        MessageBoxW(hwnd, L"\u4e00\u6587\u504f\u79fb\u5fc5\u987b\u662f\u6574\u6570",
                     L"\u63d0\u793a", MB_ICONWARNING);
-        TabCtrl_SetCurSel(st->hTab, PageArticle);
         ShowPage(st, PageArticle);
-        SetFocus(st->hComboArtAnchor);
+        SetFocus(st->hEditArtX);
         return false;
     }
-    st->cfg.articleAnchor = static_cast<WindowAnchor>(artAnchorSel);
-
-    GetWindowTextW(st->hEditArtX, buf, 256);
-    int artX = _wtoi(buf);
-    GetWindowTextW(st->hEditArtY, buf, 256);
-    int artY = _wtoi(buf);
     if (artX < -10000 || artX > 10000 || artY < -10000 || artY > 10000) {
         MessageBoxW(hwnd, L"\u4e00\u6587\u504f\u79fb\u8303\u56f4\u5e94\u5728 -10000\u201310000 \u4e4b\u95f4",
                     L"\u63d0\u793a", MB_ICONWARNING);
-        TabCtrl_SetCurSel(st->hTab, PageArticle);
         ShowPage(st, PageArticle);
         SetFocus(st->hEditArtX);
         return false;
@@ -694,63 +1508,55 @@ static bool CollectAndValidate(HWND hwnd, SettingsState* st) {
     st->cfg.articlePlaceX = artX;
     st->cfg.articlePlaceY = artY;
 
-    BOOL errH = FALSE, errM = FALSE, errS = FALSE;
-    int artH = static_cast<int>(SendMessageW(st->hUdArtH, UDM_GETPOS32, 0,
-                          reinterpret_cast<LPARAM>(&errH)));
-    int artM = static_cast<int>(SendMessageW(st->hUdArtM, UDM_GETPOS32, 0,
-                          reinterpret_cast<LPARAM>(&errM)));
-    int artS = static_cast<int>(SendMessageW(st->hUdArtS, UDM_GETPOS32, 0,
-                          reinterpret_cast<LPARAM>(&errS)));
+    // 一文刷新间隔
+    int artH = 0, artM = 0, artS = 0;
+    if (!ParseIntField(st->hEditArtH, artH) ||
+        !ParseIntField(st->hEditArtM, artM) ||
+        !ParseIntField(st->hEditArtS, artS)) {
+        MessageBoxW(hwnd, L"\u4e00\u6587\u5237\u65b0\u65f6\u95f4\u5fc5\u987b\u662f\u6574\u6570",
+                    L"\u63d0\u793a", MB_ICONWARNING);
+        ShowPage(st, PageArticle);
+        SetFocus(st->hEditArtH);
+        return false;
+    }
     int artTotal = artH * 3600 + artM * 60 + artS;
-    if (errH || errM || errS || artH < 0 || artH > 23
-        || artM < 0 || artM > 59 || artS < 0 || artS > 59
+    if (artH < 0 || artH > 23 || artM < 0 || artM > 59
+        || artS < 0 || artS > 59
         || artTotal < 1 || artTotal > 86399) {
         MessageBoxW(hwnd, L"\u4e00\u6587\u5237\u65b0\u65f6\u95f4\u5e94\u5728 00:00:01\u201323:59:59 \u4e4b\u95f4",
                     L"\u63d0\u793a", MB_ICONWARNING);
-        TabCtrl_SetCurSel(st->hTab, PageArticle);
         ShowPage(st, PageArticle);
         SetFocus(st->hEditArtH);
         return false;
     }
     st->cfg.articleRefreshSec = artTotal;
 
-    // 一文置顶（独立于倒计时）
-    st->cfg.articleIsTop = (Button_GetCheck(st->hCheckArtTop) == BST_CHECKED);
+    st->cfg.articleIsTop = st->optArtTop;
 
     // 一文字号
-    BOOL errFont = FALSE;
-    int artFont = static_cast<int>(SendMessageW(st->hUdArtFont, UDM_GETPOS32, 0,
-                          reinterpret_cast<LPARAM>(&errFont)));
-    if (errFont || artFont < 8 || artFont > 96) {
+    int artFont = 0;
+    if (!ParseIntField(st->hEditArtFont, artFont) || artFont < 8 || artFont > 96) {
         MessageBoxW(hwnd, L"\u4e00\u6587\u5b57\u53f7\u5e94\u5728 8\u201396 \u4e4b\u95f4",
                     L"\u63d0\u793a", MB_ICONWARNING);
-        TabCtrl_SetCurSel(st->hTab, PageArticle);
         ShowPage(st, PageArticle);
         SetFocus(st->hEditArtFont);
         return false;
     }
     st->cfg.articleFontSize = artFont;
 
-    // 一文尺寸模式
-    int sizeMode = ComboBox_GetCurSel(st->hComboArtSize);
-    if (sizeMode < 0 || sizeMode > 2) {
-        MessageBoxW(hwnd, L"\u8bf7\u9009\u62e9\u4e00\u6587\u5c3a\u5bf8\u6a21\u5f0f",
+    // 一文尺寸
+    int artW = 0, artHgt = 0;
+    if (!ParseIntField(st->hEditArtWidth, artW)
+        || !ParseIntField(st->hEditArtHeight, artHgt)) {
+        MessageBoxW(hwnd, L"\u4e00\u6587\u5c3a\u5bf8\u5fc5\u987b\u662f\u6574\u6570",
                     L"\u63d0\u793a", MB_ICONWARNING);
-        TabCtrl_SetCurSel(st->hTab, PageArticle);
         ShowPage(st, PageArticle);
-        SetFocus(st->hComboArtSize);
+        SetFocus(st->hEditArtWidth);
         return false;
     }
-    st->cfg.articleSizeMode = static_cast<ArticleSizeMode>(sizeMode);
-
-    GetWindowTextW(st->hEditArtWidth, buf, 256);
-    int artW = _wtoi(buf);
-    GetWindowTextW(st->hEditArtHeight, buf, 256);
-    int artHgt = _wtoi(buf);
     if (artW < 180 || artW > 1200 || artHgt < 120 || artHgt > 2000) {
         MessageBoxW(hwnd, L"\u4e00\u6587\u5c3a\u5bf8\u5e94\u4e3a\uff1a\u5bbd 180\u20131200\u3001\u9ad8 120\u20132000",
                     L"\u63d0\u793a", MB_ICONWARNING);
-        TabCtrl_SetCurSel(st->hTab, PageArticle);
         ShowPage(st, PageArticle);
         SetFocus(st->hEditArtWidth);
         return false;
@@ -758,39 +1564,28 @@ static bool CollectAndValidate(HWND hwnd, SettingsState* st) {
     st->cfg.articleWidth = artW;
     st->cfg.articleHeight = artHgt;
 
-    // 始终置顶
-    st->cfg.isTop = (Button_GetCheck(st->hCheckTop) == BST_CHECKED);
+    // 始终置顶 / 开机自启动
+    st->cfg.isTop = st->optTopMost;
+    st->cfg.autoStart = st->optAutoStart;
 
-    // 窗口位置锚点
-    int anchorSel = ComboBox_GetCurSel(st->hComboAnchor);
-    if (anchorSel < 0 || anchorSel > 8) {
-        MessageBoxW(hwnd, L"\u8bf7\u9009\u62e9\u7a97\u53e3\u4f4d\u7f6e",
+    // 窗口偏移
+    int px = 0, py = 0;
+    if (!ParseIntField(st->hEditPlaceX, px) || !ParseIntField(st->hEditPlaceY, py)) {
+        MessageBoxW(hwnd, L"\u504f\u79fb\u5fc5\u987b\u662f\u6574\u6570",
                     L"\u63d0\u793a", MB_ICONWARNING);
-        TabCtrl_SetCurSel(st->hTab, PageWindow);
         ShowPage(st, PageWindow);
-        SetFocus(st->hComboAnchor);
+        SetFocus(st->hEditPlaceX);
         return false;
     }
-    st->cfg.anchor = static_cast<WindowAnchor>(anchorSel);
-
-    // 偏移（可为负，空输入按 0 处理）
-    GetWindowTextW(st->hEditPlaceX, buf, 256);
-    int px = _wtoi(buf);
-    GetWindowTextW(st->hEditPlaceY, buf, 256);
-    int py = _wtoi(buf);
     if (px < -10000 || px > 10000 || py < -10000 || py > 10000) {
         MessageBoxW(hwnd, L"\u504f\u79fb\u8303\u56f4\u5e94\u5728 -10000\u201310000 \u4e4b\u95f4",
                     L"\u63d0\u793a", MB_ICONWARNING);
-        TabCtrl_SetCurSel(st->hTab, PageWindow);
         ShowPage(st, PageWindow);
         SetFocus(st->hEditPlaceX);
         return false;
     }
     st->cfg.placeX = px;
     st->cfg.placeY = py;
-
-    // 开机自启动
-    st->cfg.autoStart = (Button_GetCheck(st->hCheckAuto) == BST_CHECKED);
 
     if (!st->cfg.Save()) {
         MessageBoxW(hwnd, L"\u4fdd\u5b58\u914d\u7f6e\u5931\u8d25",
@@ -806,7 +1601,7 @@ static bool CollectAndValidate(HWND hwnd, SettingsState* st) {
 }
 
 // ---------------------------------------------------------------------------
-// 自有窗口过程：通过 GWLP_USERDATA 持有 SettingsState*
+// 窗口过程
 // ---------------------------------------------------------------------------
 static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     SettingsState* st = nullptr;
@@ -823,99 +1618,267 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         case WM_CREATE:
             OnCreate(hwnd, st);
             return 0; // 继续创建窗口
-        case WM_NOTIFY: {
-            auto* nm = reinterpret_cast<NMHDR*>(lp);
-            if (nm && nm->idFrom == IDC_TAB_MAIN
-                && nm->code == TCN_SELCHANGE && st && st->hTab) {
-                ShowPage(st, TabCtrl_GetCurSel(st->hTab));
-                return 0;
+
+        case WM_ERASEBKGND:
+            return 1;
+
+        case WM_PAINT:
+            PaintDialog(hwnd, st);
+            return 0;
+
+        case WM_ACTIVATE:
+            if (st && LOWORD(wp) == WA_INACTIVE) {
+                CloseDropdown(st);
+                CloseCalendarPopup(st);
             }
-            return DefWindowProcW(hwnd, msg, wp, lp);
+            break;
+
+        case WM_ENTERSIZEMOVE:
+            if (st) {
+                CloseDropdown(st);
+                CloseCalendarPopup(st);
+            }
+            break;
+
+        case WM_NCHITTEST: {
+            if (!st) break;
+            POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            ScreenToClient(hwnd, &pt);
+            // 顶部窄条与标签栏右侧空白区域可拖动窗口
+            if (pt.y < st->S(10)) return HTCAPTION;
+            if (pt.y < st->S(kTabDivider) && !st->tabRects.empty() &&
+                pt.x > st->tabRects.back().right + st->S(16)) {
+                return HTCAPTION;
+            }
+            return HTCLIENT;
         }
+
+        case WM_MOUSEMOVE: {
+            if (!st) break;
+            POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            int hover = -1;
+            for (int i = 0; i < static_cast<int>(st->tabRects.size()); ++i) {
+                if (PtInRect(&st->tabRects[i], pt)) { hover = i; break; }
+            }
+            if (hover != st->hoverTab) {
+                st->hoverTab = hover;
+                RECT bar{0, 0, 4000, st->S(kTabDivider + 4)};
+                InvalidateRect(hwnd, &bar, FALSE);
+            }
+            if (!st->trackingMouse) {
+                TRACKMOUSEEVENT tme{};
+                tme.cbSize = sizeof(tme);
+                tme.dwFlags = TME_LEAVE;
+                tme.hwndTrack = hwnd;
+                TrackMouseEvent(&tme);
+                st->trackingMouse = true;
+            }
+            break;
+        }
+
+        case WM_MOUSELEAVE:
+            if (st) {
+                st->trackingMouse = false;
+                if (st->hoverTab != -1) {
+                    st->hoverTab = -1;
+                    RECT bar{0, 0, 4000, st->S(kTabDivider + 4)};
+                    InvalidateRect(hwnd, &bar, FALSE);
+                }
+            }
+            break;
+
+        case WM_LBUTTONDOWN: {
+            if (!st) break;
+            POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            CloseDropdown(st);
+            CloseCalendarPopup(st);
+            for (int i = 0; i < static_cast<int>(st->tabRects.size()); ++i) {
+                if (PtInRect(&st->tabRects[i], pt)) {
+                    if (st->page != i) ShowPage(st, i);
+                    return 0;
+                }
+            }
+            break;
+        }
+
         case WM_DRAWITEM: {
             auto* dis = reinterpret_cast<DRAWITEMSTRUCT*>(lp);
-            if (st && st->hTab && dis && dis->hwndItem == st->hTab) {
-                wchar_t text[128] = {0};
-                TCITEMW item{};
-                item.mask = TCIF_TEXT;
-                item.pszText = text;
-                item.cchTextMax = 128;
-                TabCtrl_GetItem(st->hTab, static_cast<int>(dis->itemID), &item);
-
-                bool selected = (dis->itemState & ODS_SELECTED) != 0;
-                HBRUSH bg = CreateSolidBrush(selected ? RGB(0, 95, 184)
-                                                      : GetSysColor(COLOR_BTNFACE));
-                FillRect(dis->hDC, &dis->rcItem, bg);
-                DeleteObject(bg);
-
-                SetBkMode(dis->hDC, TRANSPARENT);
-                SetTextColor(dis->hDC,
-                             selected ? RGB(255, 255, 255) : RGB(40, 40, 40));
-                HFONT useFont = (selected && st->boldFont) ? st->boldFont : st->font;
-                HFONT oldFont = useFont
-                    ? (HFONT)SelectObject(dis->hDC, useFont) : nullptr;
-                RECT rc = dis->rcItem;
-                DrawTextW(dis->hDC, text, -1, &rc,
-                          DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-                if (oldFont) SelectObject(dis->hDC, oldFont);
+            if (st && dis && dis->CtlType == ODT_BUTTON) {
+                DrawOwnerButton(st, dis);
                 return TRUE;
             }
-            return DefWindowProcW(hwnd, msg, wp, lp);
+            break;
         }
+
         case WM_CTLCOLORSTATIC:
         case WM_CTLCOLORBTN: {
-            // 明确设置深色文字 + 对话框底色，提升标签对比度
+            if (!st || !st->brBg) break;
             HDC dc = reinterpret_cast<HDC>(wp);
             SetBkMode(dc, TRANSPARENT);
-            SetTextColor(dc, RGB(24, 24, 24));
-            SetBkColor(dc, GetSysColor(COLOR_BTNFACE));
-            return reinterpret_cast<LRESULT>(GetSysColorBrush(COLOR_BTNFACE));
+            SetTextColor(dc, kLabel);
+            SetBkColor(dc, kBg);
+            return reinterpret_cast<LRESULT>(st->brBg);
         }
+
+        case WM_CTLCOLOREDIT: {
+            if (!st || !st->brChip) break;
+            HDC dc = reinterpret_cast<HDC>(wp);
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, kValueText);
+            SetBkColor(dc, kChipBg);
+            return reinterpret_cast<LRESULT>(st->brChip);
+        }
+
+        case WM_CTLCOLORLISTBOX: {
+            if (!st || !st->brChip) break;
+            HDC dc = reinterpret_cast<HDC>(wp);
+            SetBkMode(dc, OPAQUE);
+            SetTextColor(dc, kValueText);
+            SetBkColor(dc, kChipBg);
+            return reinterpret_cast<LRESULT>(st->brChip);
+        }
+
+        case DM_GETDEFID: // 让 IsDialogMessage 的 Enter 键落到“保存”
+            return MAKELRESULT(IDC_BTN_SAVE, DC_HASDEFID);
+
+        case WM_NOTIFY: {
+            auto* nm = reinterpret_cast<NMHDR*>(lp);
+            if (st && nm && nm->hwndFrom == st->hCalPopup) {
+                if (nm->code == MCN_SELECT) {
+                    auto* sel = reinterpret_cast<NMSELCHANGE*>(lp);
+                    wchar_t dateText[32];
+                    swprintf_s(dateText, L"%04d-%02d-%02d",
+                               sel->stSelStart.wYear, sel->stSelStart.wMonth,
+                               sel->stSelStart.wDay);
+                    SetWindowTextW(st->hEditDate, dateText);
+                    // 延后关闭：不要在月历自身的通知里销毁月历
+                    PostMessageW(st->dlg, WM_APP_CLOSE_CALENDAR, 0, 0);
+                    return 0;
+                }
+                // 不处理 NM_KILLFOCUS：年月按钮会临时拿走焦点，
+                // 若在此关闭月历会导致年份按钮点不动；关闭统一走
+                // WM_COMMAND 的焦点通知 + 背景点击 + WM_ACTIVATE
+            }
+            break;
+        }
+
+        case WM_APP_CLOSE_CALENDAR: {
+            if (st && st->hCalPopup) {
+                HWND dateEdit = st->hEditDate;
+                CloseCalendarPopup(st);
+                if (dateEdit && IsWindow(dateEdit)) SetFocus(dateEdit);
+            }
+            return 0;
+        }
+
         case WM_COMMAND: {
+            if (!st) break;
             WORD id = LOWORD(wp);
+            WORD code = HIWORD(wp);
+            HWND ctl = reinterpret_cast<HWND>(lp);
+
+            // 焦点切换时重绘值胶囊的强调边框
+            if (code == EN_SETFOCUS || code == EN_KILLFOCUS ||
+                code == CBN_SETFOCUS || code == CBN_KILLFOCUS ||
+                code == BN_SETFOCUS || code == BN_KILLFOCUS) {
+                InvalidateRect(hwnd, nullptr, TRUE);
+            }
+
+            // 点击其它控件时收起浮层（用焦点通知判断，避免 WM_PARENTNOTIFY
+            // 的 lParam 坐标被误当成窗口句柄导致浮层被立刻关闭）
+            if (code == EN_SETFOCUS || code == CBN_SETFOCUS || code == BN_SETFOCUS) {
+                if (st->hDropdown && ctl != st->hDropdownTrigger) {
+                    CloseDropdown(st);
+                }
+                if (st->hCalPopup && ctl != st->hBtnCalendar &&
+                    ctl != st->hCalPrevYear && ctl != st->hCalNextYear) {
+                    CloseCalendarPopup(st);
+                }
+            }
+
+            if (ctl) {
+                // 下拉触发按钮：点击展开/收起
+                for (auto& d : st->dropdowns) {
+                    if (d.trigger == ctl) {
+                        if (code == BN_CLICKED) OpenDropdown(st, &d);
+                        return 0;
+                    }
+                }
+                // 步进器的 − / + 按钮
+                for (auto& n : st->numbers) {
+                    if (ctl == n.minus || ctl == n.plus) {
+                        if (code == BN_CLICKED) {
+                            AdjustNumber(n, ctl == n.plus ? 1 : -1);
+                        }
+                        return 0;
+                    }
+                }
+            }
+
             switch (id) {
                 case IDC_BTN_SAVE:
+                    if (code != BN_CLICKED) return 0;
+                    if (CollectAndValidate(hwnd, st)) DestroyWindow(hwnd);
+                    return 0;
                 case IDOK:
-                    if (CollectAndValidate(hwnd, st)) {
-                        DestroyWindow(hwnd);
-                    }
+                    if (CollectAndValidate(hwnd, st)) DestroyWindow(hwnd);
                     return 0;
                 case IDC_BTN_CANCEL:
+                    if (code != BN_CLICKED) return 0;
+                    DestroyWindow(hwnd);
+                    return 0;
                 case IDCANCEL:
                     DestroyWindow(hwnd);
                     return 0;
-                case IDC_CHECK_CYCLE:
-                    if (HIWORD(wp) == BN_CLICKED && st && st->hComboCycle) {
-                        bool on = (Button_GetCheck(st->hCheckCycle) == BST_CHECKED);
-                        EnableWindow(st->hComboCycle, on ? TRUE : FALSE);
-                    }
+
+                case IDC_BTN_CALENDAR:
+                    if (code == BN_CLICKED) OpenCalendarPopup(st);
                     return 0;
-                case IDC_COMBO_ARTICLE_SIZE_MODE:
-                    if (HIWORD(wp) == CBN_SELCHANGE && st) {
-                        UpdateArticleSizeControls(st);
-                    }
+
+                case IDC_CAL_PREV_YEAR:
+                    if (code == BN_CLICKED) AdjustCalendarYear(st, -1);
                     return 0;
+
+                case IDC_CAL_NEXT_YEAR:
+                    if (code == BN_CLICKED) AdjustCalendarYear(st, +1);
+                    return 0;
+
+                default:
+                    if (IsToggleId(id)) {
+                        if (code == BN_CLICKED) {
+                            bool& v = ToggleRef(st, id);
+                            v = !v;
+                            InvalidateRect(reinterpret_cast<HWND>(lp), nullptr, TRUE);
+                        }
+                        return 0;
+                    }
+                    break;
             }
             return 0;
         }
+
         case WM_CLOSE:
             DestroyWindow(hwnd);
             return 0;
+
         case WM_DESTROY:
             if (st) {
+                CloseDropdown(st);
+                CloseCalendarPopup(st);
                 st->dlg = nullptr;
                 st->running = false;
             }
             return 0;
+
         default:
-            return DefWindowProcW(hwnd, msg, wp, lp);
+            break;
     }
+    return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
 // ---------------------------------------------------------------------------
 bool OpenSettingsDialog(HWND parent, Config& cfg) {
-    // 防重入：已有设置窗口时忽略本次调用（否则托盘消息在模态循环中被
-    // 派发到主窗口，会嵌套打开第二个设置窗口，破坏模态消息循环）
+    // 防重入：已有设置窗口时忽略本次调用
     if (FindWindowW(kClass, nullptr) != nullptr) return false;
 
     HINSTANCE hInst = (HINSTANCE)GetWindowLongPtrW(parent, GWLP_HINSTANCE);
@@ -930,24 +1893,21 @@ bool OpenSettingsDialog(HWND parent, Config& cfg) {
     st.parent = parent;
     st.dpi = static_cast<UINT>(utils::GetWindowDpi(parent));
 
-    int winW = st.S(kWinW);
-    int winH = st.S(kWinH);
-
-    // 居中到父窗口（如父窗口尺寸过小，则退回屏幕居中）
-    RECT prc{};
-    GetWindowRect(parent, &prc);
-    int x = prc.left + ((prc.right - prc.left) - winW) / 2;
-    int y = prc.top + ((prc.bottom - prc.top) - winH) / 2;
-    if (prc.right - prc.left < winW || prc.bottom - prc.top < winH) {
-        RECT work{};
-        SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
-        x = work.left + ((work.right - work.left) - winW) / 2;
-        y = work.top + ((work.bottom - work.top) - winH) / 2;
+    // 窗口尺寸按当前显示器工作区裁剪，避免高缩放下底部按钮被裁掉
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    HMONITOR mon = MonitorFromWindow(parent, MONITOR_DEFAULTTONEAREST);
+    if (!mon || !GetMonitorInfoW(mon, &mi)) {
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &mi.rcWork, 0);
     }
-    if (x < 0) x = 0;
-    if (y < 0) y = 0;
+    int workW = mi.rcWork.right - mi.rcWork.left;
+    int workH = mi.rcWork.bottom - mi.rcWork.top;
+    int winW = std::min(st.S(kWinW), workW - st.S(16));
+    int winH = std::min(st.S(kWinH), workH - st.S(16));
+    int x = mi.rcWork.left + (workW - winW) / 2;
+    int y = mi.rcWork.top + (workH - winH) / 2;
 
-    // UI 字体按 DPI 缩放（DEFAULT_GUI_FONT 在 PerMonitor 下不会跟随窗口 DPI）
+    // 字体必须先于窗口创建（OnCreate 需要用它测量标签页）
     st.font = CreateFontW(-st.S(12), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                           DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                           CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
@@ -959,10 +1919,9 @@ bool OpenSettingsDialog(HWND parent, Config& cfg) {
                               DEFAULT_PITCH | FF_DONTCARE,
                               utils::GetSystemDefaultFontName().c_str());
 
-    // 通过 lpParam 把 SettingsState* 传给窗口过程（WM_NCCREATE 时取出）
-    st.dlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, kClass,
+    st.dlg = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, kClass,
         L"\u8bbe\u7f6e",
-        WS_POPUPWINDOW | WS_CAPTION,
+        WS_POPUP | WS_CLIPCHILDREN,
         x, y, winW, winH,
         parent, nullptr, hInst, &st);
 
@@ -976,27 +1935,62 @@ bool OpenSettingsDialog(HWND parent, Config& cfg) {
         return false;
     }
 
+    // 圆角窗口
+    SetWindowRgn(st.dlg,
+        CreateRoundRectRgn(0, 0, winW + 1, winH + 1, st.S(24), st.S(24)), TRUE);
+
     EnableWindow(parent, FALSE);
     ShowWindow(st.dlg, SW_SHOW);
     UpdateWindow(st.dlg);
 
-    // 模态消息循环
+    // 模态消息循环。需自行处理三种提前退出情形，避免吞掉退出消息或留下无主窗口：
+    //  1) 设置窗口关闭 -> st.running=false；
+    //  2) 父窗口先被销毁（如托盘“退出”）；
+    //  3) 收到 WM_QUIT -> 重新投递，交给外层主消息循环
     MSG msg;
-    while (st.running && GetMessage(&msg, nullptr, 0, 0) > 0) {
+    while (st.running) {
+        if (st.parent && !IsWindow(st.parent)) break;
+        BOOL got = GetMessage(&msg, nullptr, 0, 0);
+        if (got <= 0) {
+            if (got == 0) PostQuitMessage(static_cast<int>(msg.wParam));
+            break;
+        }
+        // 浮层打开时 Esc 只收起浮层，不关闭整个设置窗口
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE &&
+            (st.hDropdown || st.hCalPopup)) {
+            CloseDropdown(&st);
+            CloseCalendarPopup(&st);
+            continue;
+        }
         if (!st.dlg || !IsDialogMessageW(st.dlg, &msg)) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+    }
+    if (st.dlg) {
+        DestroyWindow(st.dlg);
+        st.dlg = nullptr;
     }
 
     EnableWindow(parent, TRUE);
     SetForegroundWindow(parent);
     if (st.font) DeleteObject(st.font);
     if (st.boldFont) DeleteObject(st.boldFont);
+    if (st.brBg) DeleteObject(st.brBg);
+    if (st.brChip) DeleteObject(st.brChip);
 
     if (st.saved) {
         cfg = st.cfg;
         return true;
     }
     return false;
+}
+
+// ---------------------------------------------------------------------------
+void CloseSettingsWindow() {
+    // 设置窗口当前位于它自己的模态消息循环中；这里同步关闭后，
+    // OpenSettingsDialog 的循环会因 running=false 正常退出并返回调用方
+    if (HWND dlg = FindWindowW(kClass, nullptr)) {
+        SendMessageW(dlg, WM_CLOSE, 0, 0);
+    }
 }
