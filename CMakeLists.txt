@@ -11,6 +11,7 @@ set(SOURCES
     src/main.cpp
     src/config.cpp
     src/utils.cpp
+    src/history.cpp
     src/autostart.cpp
     src/countdown_window.cpp
     src/article_window.cpp

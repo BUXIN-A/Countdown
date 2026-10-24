@@ -75,5 +75,8 @@
 #define IDC_BTN_STEP_MINUS         3047
 #define IDC_BTN_STEP_PLUS          3048
 #define IDC_DROPDOWN_LIST          3049
+// 外观颜色
+#define IDC_BTN_BG_COLOR           3052
+#define IDC_BTN_TEXT_COLOR         3053
 // 设置页标签
 #define IDC_TAB_MAIN               3030

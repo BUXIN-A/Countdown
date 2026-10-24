@@ -6,6 +6,7 @@
 #include <windows.h>
 #include <string>
 #include <algorithm>
+#include <cstdio>
 #include <set>
 #include <sstream>
 #include <iomanip>
@@ -85,6 +86,140 @@ std::vector<std::wstring> EnumerateSystemFonts() {
     std::vector<std::wstring> result(ctx.names.begin(), ctx.names.end());
     std::sort(result.begin(), result.end());
     return result;
+}
+
+// ---------------------------------------------------------------------------
+// 本地字体（exe\fonts）：AddFontResourceEx 仅对当前进程生效，不装进系统
+// ---------------------------------------------------------------------------
+static std::wstring LowerPath(std::wstring path) {
+    if (!path.empty()) CharLowerW(&path[0]);
+    return path;
+}
+
+static std::vector<std::wstring> ListFontFiles(const std::wstring& dir) {
+    std::vector<std::wstring> files;
+    static const wchar_t* kPatterns[] = {
+        L"*.ttf", L"*.otf", L"*.ttc", L"*.otc",
+    };
+
+    std::wstring base = dir;
+    if (!base.empty() && base.back() != L'\\' && base.back() != L'/') {
+        base += L'\\';
+    }
+    for (const wchar_t* pattern : kPatterns) {
+        WIN32_FIND_DATAW fd{};
+        HANDLE h = FindFirstFileW((base + pattern).c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            files.push_back(base + fd.cFileName);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    return files;
+}
+
+std::vector<std::wstring> LoadLocalFonts() {
+    static std::set<std::wstring> loadedFiles;   // 已加载过的文件（小写路径）
+    static std::set<std::wstring> localFamilies; // 本进程加载出的字体族
+    static std::set<std::wstring> systemFamilies;
+    static bool baselineCaptured = false;
+
+    // 首次调用先记录系统原有字体，之后新增的字体族即视为本地字体
+    if (!baselineCaptured) {
+        auto sys = EnumerateSystemFonts();
+        systemFamilies.insert(sys.begin(), sys.end());
+        baselineCaptured = true;
+    }
+
+    std::wstring dir = GetExeDir() + L"fonts";
+    EnsureDirectory(dir);
+    std::vector<std::wstring> files = ListFontFiles(dir);
+
+    bool added = false;
+    std::set<std::wstring> present;
+    for (const auto& file : files) {
+        std::wstring key = LowerPath(file);
+        present.insert(key);
+        if (loadedFiles.count(key)) continue;
+        if (AddFontResourceExW(file.c_str(), FR_PRIVATE, 0) != 0) {
+            loadedFiles.insert(key);
+            added = true;
+        }
+    }
+    // 文件被移走后从“已加载”集合里剔除，下次重新出现时会再次加载；
+    // 加载失败的文件不加入 loadedFiles，下次打开设置会重试
+    for (auto it = loadedFiles.begin(); it != loadedFiles.end(); ) {
+        if (!present.count(*it)) it = loadedFiles.erase(it);
+        else ++it;
+    }
+
+    if (added) {
+        auto after = EnumerateSystemFonts();
+        for (const auto& name : after) {
+            if (!systemFamilies.count(name)) localFamilies.insert(name);
+        }
+    }
+
+    std::vector<std::wstring> result(localFamilies.begin(), localFamilies.end());
+    std::sort(result.begin(), result.end());
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// 颜色工具
+// ---------------------------------------------------------------------------
+std::string ColorToHex(COLORREF color) {
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "#%02X%02X%02X",
+                  static_cast<int>(GetRValue(color)),
+                  static_cast<int>(GetGValue(color)),
+                  static_cast<int>(GetBValue(color)));
+    return std::string(buf);
+}
+
+static int HexDigit(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+bool ParseHexColor(const std::string& text, COLORREF& out) {
+    std::string s = text;
+    size_t begin = 0;
+    while (begin < s.size() && (s[begin] == ' ' || s[begin] == '\t')) ++begin;
+    s = s.substr(begin);
+    while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.pop_back();
+    if (!s.empty() && s[0] == '#') s.erase(0, 1);
+    if (s.size() != 6) return false;
+
+    int v[6];
+    for (int i = 0; i < 6; ++i) {
+        v[i] = HexDigit(s[i]);
+        if (v[i] < 0) return false;
+    }
+    out = RGB(v[0] * 16 + v[1], v[2] * 16 + v[3], v[4] * 16 + v[5]);
+    return true;
+}
+
+static int ClampChannel(int v) {
+    return v < 0 ? 0 : (v > 255 ? 255 : v);
+}
+
+COLORREF ScaleColor(COLORREF color, float factor) {
+    return RGB(ClampChannel(static_cast<int>(GetRValue(color) * factor + 0.5f)),
+               ClampChannel(static_cast<int>(GetGValue(color) * factor + 0.5f)),
+               ClampChannel(static_cast<int>(GetBValue(color) * factor + 0.5f)));
+}
+
+COLORREF BlendColor(COLORREF a, COLORREF b, float t) {
+    auto mix = [t](int from, int to) {
+        return ClampChannel(static_cast<int>(from + (to - from) * t + 0.5f));
+    };
+    return RGB(mix(GetRValue(a), GetRValue(b)),
+               mix(GetGValue(a), GetGValue(b)),
+               mix(GetBValue(a), GetBValue(b)));
 }
 
 // ---------------------------------------------------------------------------

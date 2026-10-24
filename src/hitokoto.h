@@ -5,7 +5,9 @@
 //  1. 按配置来源（本地/网络/本地和网络）周期获取一句一言；
 //  2. 维护当前文本与"渐隐 -> 换文本 -> 渐显"的切换动画状态机；
 //  3. 本地语句存放在 exe 同目录 hitokoto\ 文件夹（读取所有 .txt，每行一句，
-//     UTF-8）；文件夹为空时自动生成 default.txt。
+//     UTF-8）；文件夹为空时自动生成 default.txt；
+//  4. 已显示过的语句记录在 temp\hitokoto_local.txt / hitokoto_network.txt，
+//     随机时优先跳过已记录内容；一轮全部看过后清空对应记录。
 //
 // 网络请求在后台线程执行，完成后经 WM_APP_HITOKOTO 通知主窗口（线程安全：
 // 后台线程不直接触碰成员，仅 PostMessage 传递堆分配的字符串）。
@@ -52,7 +54,7 @@ private:
     void CreateDefaultLocalFile();       // 写入默认语句列表
     void TakeLocal();                    // 从本地列表随机取一句并开始切换
     void StartNetwork();                 // 启动后台线程请求网络一言
-    static std::wstring FetchNetwork();  // 阻塞执行网络请求（在后台线程调用）
+    static std::wstring FetchNetwork(const std::string& category); // 阻塞请求（后台线程）
 
     HWND  hwnd_ = nullptr;
     Config cfg_;

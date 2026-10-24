@@ -2,6 +2,7 @@
 // config.cpp - 配置读写实现
 // =============================================================================
 #include "config.h"
+#include "hitokoto_category.h"
 #include "json.h"
 
 #include <windows.h>
@@ -15,9 +16,12 @@ static const char* kTarget   = "targetTime";
 static const char* kFormat   = "displayFormat";
 static const char* kFontSize = "fontSize";
 static const char* kFont     = "font";
+static const char* kBackgroundColor = "backgroundColor";
+static const char* kTextColor = "textColor";
 static const char* kIncludeStart = "includeStartDay";
 static const char* kCycle    = "cycle";
 static const char* kHkSource = "hitokotoSource";
+static const char* kHkCategory = "hitokotoCategory";
 static const char* kHkRefresh = "hitokotoRefreshSec";
 static const char* kArticleEnabled = "articleEnabled";
 static const char* kArticleAnchor  = "articleAnchor";
@@ -209,6 +213,18 @@ Config Config::Load() {
             std::wstring f = utils::Utf8ToWide(v->as_string());
             if (!f.empty()) c.font = f;
         }
+        if (auto* v = root.find(kBackgroundColor)) {
+            COLORREF color = 0;
+            if (utils::ParseHexColor(v->as_string(), color)) {
+                c.backgroundColor = color;
+            }
+        }
+        if (auto* v = root.find(kTextColor)) {
+            COLORREF color = 0;
+            if (utils::ParseHexColor(v->as_string(), color)) {
+                c.textColor = color;
+            }
+        }
         if (auto* v = root.find(kIncludeStart)) {
             c.includeStartDay = v->as_bool();
         }
@@ -224,6 +240,10 @@ Config Config::Load() {
         if (auto* v = root.find(kHkRefresh)) {
             int sec = static_cast<int>(v->as_number(-1));
             if (sec >= 5 && sec <= 3600) c.hitokotoRefreshSec = sec;
+        }
+        if (auto* v = root.find(kHkCategory)) {
+            std::string cat = v->as_string();
+            if (hitokoto_category::IsValidCode(cat)) c.hitokotoCategory = cat;
         }
         if (auto* v = root.find(kArticleEnabled)) {
             c.articleEnabled = v->as_bool();
@@ -298,6 +318,8 @@ bool Config::Save() const {
                     ? "DDDD HH:MM:SS" : "HH:MM:SS"));
     obj.emplace_back(kFontSize, J(fontSize));
     obj.emplace_back(kFont,     J(utils::WideToUtf8(font)));
+    obj.emplace_back(kBackgroundColor, J(utils::ColorToHex(backgroundColor)));
+    obj.emplace_back(kTextColor,       J(utils::ColorToHex(textColor)));
     obj.emplace_back(kIncludeStart, J(includeStartDay));
     obj.emplace_back(kCycle,    J(CycleToStr(cycle)));
 
@@ -305,6 +327,7 @@ bool Config::Save() const {
         hitokotoSource == HitokotoSource::Local  ? "local" :
         hitokotoSource == HitokotoSource::Network ? "network" : "both";
     obj.emplace_back(kHkSource,  J(src));
+    obj.emplace_back(kHkCategory, J(hitokotoCategory));
     obj.emplace_back(kHkRefresh, J(hitokotoRefreshSec));
     obj.emplace_back(kArticleEnabled, J(articleEnabled));
     obj.emplace_back(kArticleAnchor,  J(AnchorToStr(articleAnchor)));

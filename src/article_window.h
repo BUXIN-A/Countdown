@@ -2,7 +2,8 @@
 // article_window.h - 一文栏目（屏幕右侧长文卡片）
 //
 // 独立的分层窗口，从 exe 同目录 article\ 文件夹内所有 .txt 加载文章
-// （每个文件视为一篇），按配置的刷新时间单篇轮换。
+// （每个文件视为一篇），按配置的刷新时间随机切换，并通过 temp\article.txt
+// 记录已显示过的文章，尽量不重复；全部看过后清空记录重新开始。
 // 位置使用九宫格锚点 + 偏移，并在与倒计时窗口相交时自动避让。
 // =============================================================================
 #pragma once
@@ -39,6 +40,8 @@ private:
 
     void LoadArticles();
     void CreateDefaultFile();
+    size_t PickRandomUnseen();   // 随机选一篇未显示过的（全部看过则清空后重选）
+    void AdvanceRandom();        // 随机切换到下一篇（避免与当前重复）
     void ApplyRoundedRegion();
     void Render();
 
@@ -67,6 +70,7 @@ private:
 
     std::vector<std::wstring> articles_;
     size_t index_ = 0;
+    bool   firstPick_ = true;   // 首次显示时随机选一篇
     DWORD  lastSwitch_ = 0;
 
     // 由 Reposition 决定、Render 复用的字号

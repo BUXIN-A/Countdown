@@ -44,10 +44,14 @@ struct Config {
     utils::DisplayFormat displayFormat = utils::DisplayFormat::HMS;
     int          fontSize = 36;    // 字号（96 DPI 下的逻辑像素）
     std::wstring font;             // 字体名
+    COLORREF     backgroundColor = RGB(20, 20, 30);  // 窗口背景色
+    COLORREF     textColor = RGB(235, 235, 245);      // 文字颜色
     bool         includeStartDay = false; // 起始日是否计入倒计时（时间 +1 天）
     CycleUnit    cycle = CycleUnit::None; // 循环单位（None=不循环）
 
     HitokotoSource hitokotoSource = HitokotoSource::Both; // 一言来源
+    // 网络一言句子类型代码（对应 hitokoto.cn 的 c 参数；空 = 全部）
+    std::string hitokotoCategory;
     int hitokotoRefreshSec = 60;                          // 一言刷新间隔（秒）
 
     // 一文栏目（右侧长文卡片）

@@ -19,6 +19,16 @@ std::wstring GetSystemDefaultFontName();
 // 枚举系统已安装字体族名称（去重、按字母序）
 std::vector<std::wstring> EnumerateSystemFonts();
 
+// 加载 exe 同目录 fonts\ 下的字体文件（ttf/otf/ttc/otc，仅当前进程有效）。
+// 每次调用都会重新扫描目录，把新文件加载进来；返回本进程新增的字体族名。
+std::vector<std::wstring> LoadLocalFonts();
+
+// 颜色工具：十六进制字符串（#RRGGBB）与 COLORREF 互转、明暗缩放、混合
+std::string ColorToHex(COLORREF color);
+bool ParseHexColor(const std::string& text, COLORREF& out);
+COLORREF ScaleColor(COLORREF color, float factor);
+COLORREF BlendColor(COLORREF a, COLORREF b, float t);
+
 // 倒计时显示格式
 enum class DisplayFormat {
     HMS,   // HH:MM:SS

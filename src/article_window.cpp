@@ -2,11 +2,14 @@
 // article_window.cpp - 一文栏目实现
 // =============================================================================
 #include "article_window.h"
+#include "history.h"
 #include "utils.h"
 
 #include <windows.h>
 #include <algorithm>
+#include <ctime>
 #include <cwctype>
+#include <random>
 
 // 默认一文（首次运行且 article 文件夹为空时写入 default.txt）
 // 同一文件内可用单独一行 /*/ 分隔多篇文章。
@@ -52,6 +55,14 @@ static void SplitArticles(const std::wstring& text,
         if (pos == std::wstring::npos) break;
         start = pos + kSep.size();
     }
+}
+
+// 随机数生成器（以时间 + 启动时刻播种）
+static std::mt19937& Rng() {
+    static std::mt19937 gen(
+        static_cast<unsigned>(std::time(nullptr)) ^
+        static_cast<unsigned>(GetTickCount()));
+    return gen;
 }
 
 // ---------------------------------------------------------------------------
@@ -157,13 +168,24 @@ void ArticleWindow::ApplyConfig(const Config& cfg) {
 
     size_t prevIndex = index_;
     LoadArticles();
-    index_ = prevIndex < articles_.size() ? prevIndex : 0;
     lastSwitch_ = GetTickCount();
     if (articles_.empty()) {
         StopAnimation();
         ShowWindow(hwnd_, SW_HIDE);
         return;
     }
+
+    if (firstPick_) {
+        // 首次显示：随机选一篇没看过的
+        index_ = PickRandomUnseen();
+        firstPick_ = false;
+    } else if (prevIndex < articles_.size()) {
+        // 配置变更时保持当前这篇，不突然换文
+        index_ = prevIndex;
+    } else {
+        index_ = PickRandomUnseen();
+    }
+    history::MarkSeen(history::Kind::Article, articles_[index_]);
     Reposition();
 }
 
@@ -201,10 +223,40 @@ void ArticleWindow::Tick() {
 
     DWORD now = GetTickCount();
     if (now - lastSwitch_ >= static_cast<DWORD>(cfg_.articleRefreshSec) * 1000) {
-        index_ = (index_ + 1) % articles_.size();
         lastSwitch_ = now;
+        AdvanceRandom();
         Reposition(); // 文章长度不同，需重新计算高度
     }
+}
+
+// 随机选一篇未显示过的文章；全部显示过则清空记录开始新一轮
+size_t ArticleWindow::PickRandomUnseen() {
+    if (articles_.empty()) return 0;
+
+    std::vector<size_t> candidates;
+    history::CollectUnseen(history::Kind::Article, articles_, candidates);
+    if (candidates.empty()) {
+        history::Clear(history::Kind::Article);
+        candidates.resize(articles_.size());
+        for (size_t i = 0; i < articles_.size(); ++i) candidates[i] = i;
+    }
+
+    std::uniform_int_distribution<size_t> dist(0, candidates.size() - 1);
+    return candidates[dist(Rng())];
+}
+
+void ArticleWindow::AdvanceRandom() {
+    if (articles_.size() <= 1) return;
+
+    // 避免与当前这篇连续重复（极少情况下全部候选都是当前这篇时放弃）
+    size_t next = index_;
+    for (int i = 0; i < 8 && next == index_; ++i) {
+        next = PickRandomUnseen();
+    }
+    if (next == index_) return;
+
+    index_ = next;
+    history::MarkSeen(history::Kind::Article, articles_[index_]);
 }
 
 // ---------------------------------------------------------------------------
@@ -575,20 +627,32 @@ void ArticleWindow::Render() {
     HDC mem = mem_dc_;
     BYTE* base = static_cast<BYTE*>(dib_bits_);
 
-    // 背景渐变
+    // 背景渐变（与主窗口共用配置的背景色，保持整体风格统一）
+    COLORREF bg = cfg_.backgroundColor;
+    COLORREF bgTop = utils::BlendColor(bg, RGB(255, 255, 255), 0.10f);
+    COLORREF bgBottom = utils::BlendColor(bg, RGB(0, 0, 0), 0.14f);
     TRIVERTEX verts[2] = {};
     verts[0].x = 0;  verts[0].y = 0;
-    verts[0].Red = 32 << 8; verts[0].Green = 32 << 8;
-    verts[0].Blue = 46 << 8; verts[0].Alpha = 255 << 8;
+    verts[0].Red   = static_cast<COLOR16>(GetRValue(bgTop) << 8);
+    verts[0].Green = static_cast<COLOR16>(GetGValue(bgTop) << 8);
+    verts[0].Blue  = static_cast<COLOR16>(GetBValue(bgTop) << 8);
+    verts[0].Alpha = static_cast<COLOR16>(255 << 8);
     verts[1].x = w;  verts[1].y = h;
-    verts[1].Red = 16 << 8; verts[1].Green = 16 << 8;
-    verts[1].Blue = 26 << 8; verts[1].Alpha = 255 << 8;
+    verts[1].Red   = static_cast<COLOR16>(GetRValue(bgBottom) << 8);
+    verts[1].Green = static_cast<COLOR16>(GetGValue(bgBottom) << 8);
+    verts[1].Blue  = static_cast<COLOR16>(GetBValue(bgBottom) << 8);
+    verts[1].Alpha = static_cast<COLOR16>(255 << 8);
     GRADIENT_RECT gr = {0, 1};
     GradientFill(mem, verts, 2, &gr, 1, GRADIENT_FILL_RECT_V);
 
-    // 圆角描边（只画边框，保留渐变）
+    // 圆角描边（只画边框，保留渐变）；深色背景提亮、浅色背景压暗
     int r = S(18);
-    HPEN pen = CreatePen(PS_SOLID, 1, RGB(78, 78, 104));
+    int bgLum = (GetRValue(bg) * 299 + GetGValue(bg) * 587 +
+                 GetBValue(bg) * 114) / 1000;
+    COLORREF borderColor = (bgLum > 140)
+                               ? utils::BlendColor(bg, RGB(0, 0, 0), 0.24f)
+                               : utils::BlendColor(bg, RGB(255, 255, 255), 0.24f);
+    HPEN pen = CreatePen(PS_SOLID, 1, borderColor);
     HGDIOBJ oldPen = SelectObject(mem, pen);
     HGDIOBJ oldBr = SelectObject(mem, GetStockObject(NULL_BRUSH));
     RoundRect(mem, 0, 0, w - 1, h - 1, r, r);
@@ -607,7 +671,7 @@ void ArticleWindow::Render() {
     if (f) {
         HFONT old = (HFONT)SelectObject(mem, f);
         SetBkMode(mem, TRANSPARENT);
-        SetTextColor(mem, RGB(228, 226, 236));
+        SetTextColor(mem, cfg_.textColor);
         RECT rc = {S(kArticlePadX), S(kArticlePadY),
                    w - S(kArticlePadX), h - S(kArticlePadY)};
         DrawTextW(mem, articles_[index_].c_str(), -1, &rc,

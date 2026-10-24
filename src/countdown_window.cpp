@@ -420,8 +420,11 @@ void CountdownWindow::DrawHitokoto(HDC mem, int w, int h,
     }
     if (!f) return; // 最小字号仍放不下：放弃本次绘制
 
-    // 文本色（与下方合成常数一致）
-    const int tR = 218, tG = 200, tB = 200;
+    // 文本色（取配置文字色并稍作柔化；与下方合成常数一致）
+    COLORREF hkColor = utils::ScaleColor(config_.textColor, 0.88f);
+    const int tR = GetRValue(hkColor);
+    const int tG = GetGValue(hkColor);
+    const int tB = GetBValue(hkColor);
 
     if (fade >= 255) {
         // 稳态：直接绘制到主 DIB
@@ -569,28 +572,46 @@ void CountdownWindow::Render() {
     HDC mem = mem_dc_;
     BYTE* base = static_cast<BYTE*>(dib_bits_);
 
-    // 背景渐变（顶深底更深）
+    // 背景：以配置色为基准做轻微渐变（顶部略亮、底部略暗）
+    int rr = h / 2;
+    COLORREF bg = config_.backgroundColor;
+    COLORREF bgTop = utils::BlendColor(bg, RGB(255, 255, 255), 0.07f);
+    COLORREF bgBottom = utils::BlendColor(bg, RGB(0, 0, 0), 0.12f);
+
     TRIVERTEX verts[2] = {};
     verts[0].x = 0;  verts[0].y = 0;
-    verts[0].Red = 28 << 8; verts[0].Green = 28 << 8;
-    verts[0].Blue = 40 << 8; verts[0].Alpha = 255 << 8;
+    verts[0].Red   = static_cast<COLOR16>(GetRValue(bgTop) << 8);
+    verts[0].Green = static_cast<COLOR16>(GetGValue(bgTop) << 8);
+    verts[0].Blue  = static_cast<COLOR16>(GetBValue(bgTop) << 8);
+    verts[0].Alpha = static_cast<COLOR16>(255 << 8);
     verts[1].x = w;  verts[1].y = h;
-    verts[1].Red = 14 << 8; verts[1].Green = 14 << 8;
-    verts[1].Blue = 22 << 8; verts[1].Alpha = 255 << 8;
+    verts[1].Red   = static_cast<COLOR16>(GetRValue(bgBottom) << 8);
+    verts[1].Green = static_cast<COLOR16>(GetGValue(bgBottom) << 8);
+    verts[1].Blue  = static_cast<COLOR16>(GetBValue(bgBottom) << 8);
+    verts[1].Alpha = static_cast<COLOR16>(255 << 8);
     GRADIENT_RECT gr = {0, 1};
-    GradientFill(mem, verts, 2, &gr, 1, GRADIENT_FILL_RECT_V);
 
-    // 微弱边框光晕
-    HPEN pen = CreatePen(PS_SOLID, 1, RGB(70, 70, 95));
+    // 渐变裁到圆角区域，避免四角出现直角
+    HRGN clip = CreateRoundRectRgn(0, 0, w, h, rr, rr);
+    int savedDc = SaveDC(mem);
+    if (clip) SelectClipRgn(mem, clip);
+    GradientFill(mem, verts, 2, &gr, 1, GRADIENT_FILL_RECT_V);
+    RestoreDC(mem, savedDc);
+    if (clip) DeleteObject(clip);
+
+    // 微弱边框光晕：深色背景提亮、浅色背景压暗，保证边框始终可见
+    int bgLum = (GetRValue(bg) * 299 + GetGValue(bg) * 587 +
+                 GetBValue(bg) * 114) / 1000;
+    COLORREF border = (bgLum > 140)
+                          ? utils::BlendColor(bg, RGB(0, 0, 0), 0.22f)
+                          : utils::BlendColor(bg, RGB(255, 255, 255), 0.22f);
+    HPEN pen = CreatePen(PS_SOLID, 1, border);
     HGDIOBJ oldPen = SelectObject(mem, pen);
-    HBRUSH br = CreateSolidBrush(RGB(20, 20, 30));
-    HGDIOBJ oldBr = SelectObject(mem, br);
-    int rr = h / 2;
+    HGDIOBJ oldBr = SelectObject(mem, GetStockObject(NULL_BRUSH));
     RoundRect(mem, 0, 0, w - 1, h - 1, rr, rr);
     SelectObject(mem, oldPen);
     SelectObject(mem, oldBr);
     DeleteObject(pen);
-    DeleteObject(br);
 
     // ---- 文本内容 ----
     long long rem = ComputeRemainingSeconds();
@@ -616,9 +637,12 @@ void CountdownWindow::Render() {
     RECT rcTarget  = {0, titleTop + titleH + contentH, w,
                       titleTop + titleH + contentH + targetH};
 
-    DrawTextCentered(mem, config_.title, fTitle_,   RGB(220, 220, 235), rcTitle);
-    DrawTextCentered(mem, content,        fContent_, RGB(255, 255, 255), rcContent);
-    DrawTextCentered(mem, target,         fTarget_,  RGB(170, 170, 190), rcTarget);
+    COLORREF textColor = config_.textColor;
+    DrawTextCentered(mem, config_.title, fTitle_,
+                     utils::ScaleColor(textColor, 0.87f), rcTitle);
+    DrawTextCentered(mem, content,        fContent_, textColor, rcContent);
+    DrawTextCentered(mem, target,         fTarget_,
+                     utils::ScaleColor(textColor, 0.64f), rcTarget);
 
     // ---- 每像素 alpha：背景与主内容全部不透明 ----
     // 按 4 字节一次位或设置 alpha=255（保留 RGB），比逐字节循环更快

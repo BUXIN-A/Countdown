@@ -11,6 +11,7 @@
 #include "settings_window.h"
 #include "../resource.h"
 #include "autostart.h"
+#include "hitokoto_category.h"
 #include "utils.h"
 
 #include <windows.h>
@@ -78,6 +79,7 @@ enum DropdownKind {
     DropCycle = 0,
     DropFormat,
     DropSource,
+    DropHkCategory,
     DropArtAnchor,
     DropWinAnchor,
     DropArtSize,
@@ -87,7 +89,8 @@ enum DropdownKind {
 struct DropdownDef {
     HWND trigger = nullptr;             // 显示当前值的胶囊按钮
     DropdownKind kind = DropCycle;
-    std::vector<std::wstring> items;
+    std::vector<std::wstring> items;    // 下拉显示文本（可带“（本地）”等标记）
+    std::vector<std::wstring> values;   // 实际值（为空时与 items 相同）
     int current = 0;
 };
 
@@ -147,7 +150,10 @@ struct SettingsState {
     HWND hBtnStart = nullptr;
     HWND hBtnFormat = nullptr;
     HWND hEditSize = nullptr;
+    HWND hBtnBgColor = nullptr;
+    HWND hBtnTextColor = nullptr;
     HWND hBtnHkSrc = nullptr;
+    HWND hBtnHkCategory = nullptr;
     HWND hEditHkRefresh = nullptr;
     HWND hBtnArticle = nullptr;
     HWND hBtnArtAnchor = nullptr;
@@ -312,12 +318,25 @@ static void ApplyDropdownSelection(SettingsState* st, DropdownDef* def, int inde
                                  static_cast<utils::DisplayFormat>(index); break;
         case DropSource:     st->cfg.hitokotoSource =
                                  static_cast<HitokotoSource>(index); break;
+        case DropHkCategory:
+            // 下拉项顺序与 kOptions 一致：index -> code（空字符串表示全部）
+            if (index >= 0 && index < hitokoto_category::Count()) {
+                st->cfg.hitokotoCategory = hitokoto_category::kOptions[index].code;
+            }
+            break;
         case DropArtAnchor:  st->cfg.articleAnchor =
                                  static_cast<WindowAnchor>(index); break;
         case DropWinAnchor:  st->cfg.anchor = static_cast<WindowAnchor>(index); break;
         case DropArtSize:    st->cfg.articleSizeMode =
                                  static_cast<ArticleSizeMode>(index); break;
-        case DropFont:       st->cfg.font = def->items[index]; break;
+        case DropFont:
+            // 本地字体的显示文本带“（本地）”标记，实际写入配置的是 values
+            if (index < static_cast<int>(def->values.size())) {
+                st->cfg.font = def->values[index];
+            } else {
+                st->cfg.font = def->items[index];
+            }
+            break;
     }
     SetWindowTextW(def->trigger, def->items[index].c_str());
     InvalidateRect(def->trigger, nullptr, TRUE);
@@ -333,6 +352,38 @@ static void AdjustNumber(NumberField& f, int delta) {
     wchar_t buf[32];
     swprintf_s(buf, L"%d", v);
     SetWindowTextW(f.edit, buf);
+}
+
+// 颜色选择：使用系统取色对话框（CC_FULLOPEN 提供完整色板）
+static COLORREF g_customColors[16] = {
+    RGB(20, 20, 30),    RGB(36, 36, 45),   RGB(62, 94, 240),
+    RGB(92, 124, 255),  RGB(235, 235, 245), RGB(170, 170, 190),
+    RGB(255, 255, 255), RGB(0, 0, 0),      RGB(70, 40, 40),
+    RGB(40, 70, 40),    RGB(40, 50, 80),   RGB(80, 60, 40),
+    RGB(120, 80, 160),  RGB(200, 120, 60), RGB(60, 160, 160),
+    RGB(200, 80, 120),
+};
+
+static void PickColor(HWND hwnd, SettingsState* st, bool background) {
+    if (!st) return;
+    CHOOSECOLORW cc{};
+    cc.lStructSize = sizeof(cc);
+    cc.hwndOwner = hwnd;
+    cc.rgbResult = background ? st->cfg.backgroundColor : st->cfg.textColor;
+    cc.lpCustColors = g_customColors;
+    cc.Flags = CC_FULLOPEN | CC_RGBINIT | CC_ANYCOLOR;
+    if (!ChooseColorW(&cc)) return;
+
+    if (background) st->cfg.backgroundColor = cc.rgbResult;
+    else            st->cfg.textColor = cc.rgbResult;
+
+    HWND btn = background ? st->hBtnBgColor : st->hBtnTextColor;
+    if (btn) {
+        std::string hex = utils::ColorToHex(cc.rgbResult);
+        std::wstring whex(hex.begin(), hex.end());
+        SetWindowTextW(btn, whex.c_str());
+        InvalidateRect(btn, nullptr, TRUE);
+    }
 }
 
 static void CloseDropdown(SettingsState* st) {
@@ -613,6 +664,21 @@ static void DrawOwnerButton(SettingsState* st, DRAWITEMSTRUCT* dis) {
         }
         SelectObject(dc, op);
         DeleteObject(pen);
+        return;
+    }
+    if (dis->CtlID == IDC_BTN_BG_COLOR || dis->CtlID == IDC_BTN_TEXT_COLOR) {
+        COLORREF color = (dis->CtlID == IDC_BTN_BG_COLOR)
+                             ? st->cfg.backgroundColor : st->cfg.textColor;
+        FillRound(dc, rc, radius, color,
+                  focused ? kAccent : (pressed ? kAccentHi : kChipBorder));
+
+        // 色块上直接显示十六进制值，按亮度自动选黑/白文字
+        std::string hex = utils::ColorToHex(color);
+        std::wstring whex(hex.begin(), hex.end());
+        int lum = (GetRValue(color) * 299 + GetGValue(color) * 587 +
+                   GetBValue(color) * 114) / 1000;
+        DrawCentered(dc, rc, whex.c_str(), st->font,
+                     lum > 140 ? RGB(24, 24, 30) : RGB(245, 245, 250));
         return;
     }
     if (IsToggleId(dis->CtlID)) {
@@ -1171,17 +1237,11 @@ static void OnCreate(HWND hwnd, SettingsState* st) {
     };
 
     // ======================= 页 1：基本 =======================
+    // 排序：最常用的目标日期/时间在前，其次循环，标题与起始日计入在后
     y = top;
     {
         const int page = PageBasic;
         int rowY = y;
-        label(L"\u5012\u8ba1\u65f6\u6807\u9898", rowY, page);
-        st->hEditTitle = edit(page, makeSlots(rowY, {300})[0],
-                              st->cfg.title.c_str(), ES_AUTOHSCROLL,
-                              IDC_EDIT_TITLE);
-        divider(page, rowY); y += st->S(kRowStep);
-
-        rowY = y;
         label(L"\u76ee\u6807\u65e5\u671f", rowY, page); // 目标日期
         auto slots = makeSlots(rowY, {140, 34});
         st->hEditDate = edit(page, slots[0],
@@ -1205,6 +1265,13 @@ static void OnCreate(HWND hwnd, SettingsState* st) {
         divider(page, rowY); y += st->S(kRowStep);
 
         rowY = y;
+        label(L"\u5012\u8ba1\u65f6\u6807\u9898", rowY, page); // 倒计时标题
+        st->hEditTitle = edit(page, makeSlots(rowY, {300})[0],
+                              st->cfg.title.c_str(), ES_AUTOHSCROLL,
+                              IDC_EDIT_TITLE);
+        divider(page, rowY); y += st->S(kRowStep);
+
+        rowY = y;
         label(L"\u8d77\u59cb\u65e5\u8ba1\u5165", rowY, page); // 起始日计入
         st->hBtnStart = chipButton(page, makeSlots(rowY, {64})[0], L"",
                                    IDC_CHECK_INCLUDE_START);
@@ -1212,17 +1279,11 @@ static void OnCreate(HWND hwnd, SettingsState* st) {
     }
 
     // ======================= 页 2：外观 =======================
+    // 排序：字号/字体（最常调） -> 颜色 -> 显示格式
     y = top;
     {
         const int page = PageAppearance;
         int rowY = y;
-        label(L"\u663e\u793a\u683c\u5f0f", rowY, page); // 显示格式
-        st->hBtnFormat = dropdown(page, makeSlots(rowY, {170})[0], DropFormat,
-                                  FormatItems(),
-                                  static_cast<int>(st->cfg.displayFormat));
-        divider(page, rowY); y += st->S(kRowStep);
-
-        rowY = y;
         label(L"\u5b57\u53f7\uff08\u50cf\u7d20\uff09", rowY, page); // 字号（像素）
         st->hEditSize = stepper(page, makeSlots(rowY, {110})[0],
                                 intText(st->cfg.fontSize).c_str(),
@@ -1234,23 +1295,64 @@ static void OnCreate(HWND hwnd, SettingsState* st) {
         if (st->cfg.font.empty()) {
             st->cfg.font = utils::GetSystemDefaultFontName();
         }
+        // 每次打开设置都重新扫描 fonts 目录（加载新字体，返回本地字体族）
+        auto locals = utils::LoadLocalFonts();
         auto fonts = utils::EnumerateSystemFonts();
         if (fonts.empty()) fonts.push_back(st->cfg.font);
+
+        std::vector<std::wstring> fontItems;
+        std::vector<std::wstring> fontValues;
+        for (const auto& name : fonts) {
+            fontValues.push_back(name);
+            bool isLocal = std::find(locals.begin(), locals.end(), name) != locals.end();
+            fontItems.push_back(isLocal
+                                    ? name + L"\uff08\u672c\u5730\uff09"
+                                    : name);
+        }
         int fontIdx = -1;
-        for (size_t i = 0; i < fonts.size(); ++i) {
-            if (fonts[i] == st->cfg.font) {
+        for (size_t i = 0; i < fontValues.size(); ++i) {
+            if (lstrcmpiW(fontValues[i].c_str(), st->cfg.font.c_str()) == 0) {
                 fontIdx = static_cast<int>(i);
                 break;
             }
         }
         if (fontIdx < 0) {
-            // 配置里的字体不在系统列表（例如从别处拷来的配置）：
+            // 配置里的字体不在列表（例如本地字体文件已被删除）：
             // 保留它并插到第一项，保证下拉显示与配置一致
-            fonts.insert(fonts.begin(), st->cfg.font);
+            fontValues.insert(fontValues.begin(), st->cfg.font);
+            fontItems.insert(fontItems.begin(), st->cfg.font);
             fontIdx = 0;
         }
-        dropdown(page, makeSlots(rowY, {280})[0], DropFont,
-                 std::move(fonts), fontIdx);
+        dropdown(page, makeSlots(rowY, {320})[0], DropFont,
+                 std::move(fontItems), fontIdx);
+        st->dropdowns.back().values = std::move(fontValues);
+        divider(page, rowY); y += st->S(kRowStep);
+
+        rowY = y;
+        label(L"\u80cc\u666f\u989c\u8272", rowY, page); // 背景颜色
+        {
+            std::string hex = utils::ColorToHex(st->cfg.backgroundColor);
+            std::wstring whex(hex.begin(), hex.end());
+            st->hBtnBgColor = chipButton(page, makeSlots(rowY, {140})[0],
+                                         whex.c_str(), IDC_BTN_BG_COLOR);
+        }
+        divider(page, rowY); y += st->S(kRowStep);
+
+        rowY = y;
+        label(L"\u5b57\u4f53\u989c\u8272", rowY, page); // 字体颜色
+        {
+            std::string hex = utils::ColorToHex(st->cfg.textColor);
+            std::wstring whex(hex.begin(), hex.end());
+            st->hBtnTextColor = chipButton(page, makeSlots(rowY, {140})[0],
+                                           whex.c_str(), IDC_BTN_TEXT_COLOR);
+        }
+        divider(page, rowY); y += st->S(kRowStep);
+
+        rowY = y;
+        label(L"\u663e\u793a\u683c\u5f0f", rowY, page); // 显示格式
+        st->hBtnFormat = dropdown(page, makeSlots(rowY, {170})[0], DropFormat,
+                                  FormatItems(),
+                                  static_cast<int>(st->cfg.displayFormat));
         divider(page, rowY); y += st->S(kRowStep);
     }
 
@@ -1266,6 +1368,20 @@ static void OnCreate(HWND hwnd, SettingsState* st) {
         divider(page, rowY); y += st->S(kRowStep);
 
         rowY = y;
+        label(L"\u7f51\u7edc\u53e5\u5b50\u7c7b\u578b", rowY, page); // 网络句子类型
+        {
+            std::vector<std::wstring> cats;
+            for (int i = 0; i < hitokoto_category::Count(); ++i) {
+                cats.push_back(hitokoto_category::kOptions[i].name);
+            }
+            int catIdx = hitokoto_category::IndexOfCode(st->cfg.hitokotoCategory);
+            if (catIdx < 0) catIdx = 0;
+            st->hBtnHkCategory = dropdown(page, makeSlots(rowY, {180})[0],
+                                          DropHkCategory, std::move(cats), catIdx);
+        }
+        divider(page, rowY); y += st->S(kRowStep);
+
+        rowY = y;
         label(L"\u5237\u65b0\u65f6\u95f4\uff08\u79d2\uff09", rowY, page); // 刷新时间（秒）
         st->hEditHkRefresh = stepper(page, makeSlots(rowY, {116})[0],
                                      intText(st->cfg.hitokotoRefreshSec).c_str(),
@@ -1275,6 +1391,7 @@ static void OnCreate(HWND hwnd, SettingsState* st) {
     }
 
     // ======================= 页 4：一文 =======================
+    // 排序：栏目/刷新/字号（内容） -> 位置/偏移 -> 尺寸模式/尺寸 -> 置顶
     y = top;
     {
         const int page = PageArticle;
@@ -1285,34 +1402,12 @@ static void OnCreate(HWND hwnd, SettingsState* st) {
         divider(page, rowY); y += st->S(kRowStep);
 
         rowY = y;
-        label(L"\u7a97\u53e3\u4f4d\u7f6e", rowY, page); // 窗口位置
-        st->hBtnArtAnchor = dropdown(page, makeSlots(rowY, {140})[0],
-                                     DropArtAnchor, AnchorItems(),
-                                     static_cast<int>(st->cfg.articleAnchor));
-        divider(page, rowY); y += st->S(kRowStep);
-
-        rowY = y;
-        label(L"\u504f\u79fb\uff08\u50cf\u7d20\uff09", rowY, page); // 偏移（像素）
-        auto slots = makeSlots(rowY, {116, 14, 116, 14});
-        st->hEditArtX = stepper(page, slots[0],
-                                intText(st->cfg.articlePlaceX).c_str(),
-                                IDC_EDIT_ARTICLE_X, -10000, 10000,
-                                ES_AUTOHSCROLL);
-        unit(page, slots[1], L"X");
-        st->hEditArtY = stepper(page, slots[2],
-                                intText(st->cfg.articlePlaceY).c_str(),
-                                IDC_EDIT_ARTICLE_Y, -10000, 10000,
-                                ES_AUTOHSCROLL);
-        unit(page, slots[3], L"Y");
-        divider(page, rowY); y += st->S(kRowStep);
-
-        rowY = y;
         label(L"\u5237\u65b0\u65f6\u95f4", rowY, page); // 刷新时间
         int totalSec = st->cfg.articleRefreshSec;
         int artH = totalSec / 3600;
         int artM = (totalSec / 60) % 60;
         int artS = totalSec % 60;
-        slots = makeSlots(rowY, {90, 14, 90, 14, 90, 14});
+        auto slots = makeSlots(rowY, {90, 14, 90, 14, 90, 14});
         st->hEditArtH = stepper(page, slots[0], intText(artH).c_str(),
                                 IDC_EDIT_ARTICLE_H, 0, 23, ES_NUMBER);
         unit(page, slots[1], L"\u65f6"); // 时
@@ -1325,16 +1420,32 @@ static void OnCreate(HWND hwnd, SettingsState* st) {
         divider(page, rowY); y += st->S(kRowStep);
 
         rowY = y;
-        label(L"\u59cb\u7ec8\u7f6e\u9876", rowY, page); // 始终置顶
-        st->hBtnArtTop = chipButton(page, makeSlots(rowY, {64})[0], L"",
-                                    IDC_CHECK_ARTICLE_TOP);
-        divider(page, rowY); y += st->S(kRowStep);
-
-        rowY = y;
         label(L"\u6b63\u6587\u5b57\u53f7", rowY, page); // 正文字号
         st->hEditArtFont = stepper(page, makeSlots(rowY, {110})[0],
                                    intText(st->cfg.articleFontSize).c_str(),
                                    IDC_EDIT_ARTICLE_FONT, 8, 96, ES_NUMBER);
+        divider(page, rowY); y += st->S(kRowStep);
+
+        rowY = y;
+        label(L"\u7a97\u53e3\u4f4d\u7f6e", rowY, page); // 窗口位置
+        st->hBtnArtAnchor = dropdown(page, makeSlots(rowY, {140})[0],
+                                     DropArtAnchor, AnchorItems(),
+                                     static_cast<int>(st->cfg.articleAnchor));
+        divider(page, rowY); y += st->S(kRowStep);
+
+        rowY = y;
+        label(L"\u504f\u79fb\uff08\u50cf\u7d20\uff09", rowY, page); // 偏移（像素）
+        slots = makeSlots(rowY, {116, 14, 116, 14});
+        st->hEditArtX = stepper(page, slots[0],
+                                intText(st->cfg.articlePlaceX).c_str(),
+                                IDC_EDIT_ARTICLE_X, -10000, 10000,
+                                ES_AUTOHSCROLL);
+        unit(page, slots[1], L"X");
+        st->hEditArtY = stepper(page, slots[2],
+                                intText(st->cfg.articlePlaceY).c_str(),
+                                IDC_EDIT_ARTICLE_Y, -10000, 10000,
+                                ES_AUTOHSCROLL);
+        unit(page, slots[3], L"Y");
         divider(page, rowY); y += st->S(kRowStep);
 
         rowY = y;
@@ -1357,6 +1468,12 @@ static void OnCreate(HWND hwnd, SettingsState* st) {
                                      IDC_EDIT_ARTICLE_HEIGHT, 120, 2000,
                                      ES_NUMBER);
         unit(page, slots[3], L"\u9ad8"); // 高
+        divider(page, rowY); y += st->S(kRowStep);
+
+        rowY = y;
+        label(L"\u59cb\u7ec8\u7f6e\u9876", rowY, page); // 始终置顶
+        st->hBtnArtTop = chipButton(page, makeSlots(rowY, {64})[0], L"",
+                                    IDC_CHECK_ARTICLE_TOP);
         divider(page, rowY); y += st->S(kRowStep);
     }
 
@@ -1419,8 +1536,8 @@ static void OnCreate(HWND hwnd, SettingsState* st) {
     }, (LPARAM)st->font);
 
     ShowPage(st, PageBasic);
-    SetFocus(st->hEditTitle);
-    SendMessageW(st->hEditTitle, EM_SETSEL, 0, 0);
+    SetFocus(st->hEditDate);
+    SendMessageW(st->hEditDate, EM_SETSEL, 0, -1);
 }
 
 // ---------------------------------------------------------------------------
@@ -1833,6 +1950,14 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
 
                 case IDC_BTN_CALENDAR:
                     if (code == BN_CLICKED) OpenCalendarPopup(st);
+                    return 0;
+
+                case IDC_BTN_BG_COLOR:
+                    if (code == BN_CLICKED) PickColor(hwnd, st, true);
+                    return 0;
+
+                case IDC_BTN_TEXT_COLOR:
+                    if (code == BN_CLICKED) PickColor(hwnd, st, false);
                     return 0;
 
                 case IDC_CAL_PREV_YEAR:

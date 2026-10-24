@@ -6,6 +6,7 @@
 
 #include "countdown_window.h"
 #include "resource.h"
+#include "utils.h"
 
 // 单实例互斥体名称（会话级：同一登录会话内保证唯一）
 static const wchar_t kSingleInstanceMutex[] = L"Local\\Countdown_SingleInstance_Mutex";
@@ -27,6 +28,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     icc.dwICC   = ICC_STANDARD_CLASSES | ICC_DATE_CLASSES
                 | ICC_UPDOWN_CLASS | ICC_BAR_CLASSES;
     InitCommonControlsEx(&icc);
+
+    // 提前加载 exe\fonts 下的本地字体：配置里若保存了本地字体，
+    // 窗口创建时就能用正确的字体渲染（不必等打开设置页）
+    utils::LoadLocalFonts();
 
     if (!CountdownWindow::RegisterClass(hInstance)) {
         MessageBoxW(nullptr, L"\u6ce8\u518c\u7a97\u53e3\u7c7b\u5931\u8d25",

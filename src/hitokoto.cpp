@@ -3,6 +3,7 @@
 // =============================================================================
 #include "hitokoto.h"
 #include "../resource.h"
+#include "history.h"
 #include "json.h"
 #include "utils.h"
 
@@ -14,10 +15,16 @@
 #include <cstdlib>
 #include <random>
 #include <ctime>
+#include <utility>
 
 // 渐隐/渐显时长（毫秒）
 static const float kFadeOutMs = 150.0f;
 static const float kFadeInMs  = 200.0f;
+
+// 网络记录达到该数量后视为“已看过一轮”，清空后重新开始
+static const int kMaxNetworkHistory = 5000;
+// 网络返回已看过的句子时，最多连续重新请求的次数
+static const int kMaxFetchRetries = 6;
 
 // 随机数生成器：以时间+启动时刻播种，避免 std::rand() 未播种时
 // 每次启动随机序列固定（本地语句/来源选择总是一样）
@@ -168,19 +175,39 @@ void HitokotoManager::CreateDefaultLocalFile() {
 
 void HitokotoManager::TakeLocal() {
     if (local_.empty()) return;
-    size_t n = local_.size();
-    size_t idx = Rng()() % n;
-    // 避免与当前显示重复（仅当列表多于一句时）
-    if (n > 1 && local_[idx] == text_) idx = (idx + 1) % n;
+    const size_t n = local_.size();
+
+    // 优先在“未显示过”的语句中随机；同时避免与当前屏幕上这句重复
+    std::vector<size_t> unseen;
+    history::CollectUnseen(history::Kind::LocalHitokoto, local_, unseen);
+
+    std::vector<size_t> candidates;
+    for (size_t idx : unseen) {
+        if (n > 1 && local_[idx] == text_) continue;
+        candidates.push_back(idx);
+    }
+
+    if (candidates.empty()) {
+        // 所有本地语句都显示过：清空记录，开始新一轮
+        history::Clear(history::Kind::LocalHitokoto);
+        for (size_t i = 0; i < n; ++i) {
+            if (n > 1 && local_[i] == text_) continue;
+            candidates.push_back(i);
+        }
+        if (candidates.empty()) candidates.push_back(0);
+    }
+
+    size_t idx = candidates[Rng()() % candidates.size()];
     pending_ = local_[idx];
     hasPending_ = true;
+    history::MarkSeen(history::Kind::LocalHitokoto, pending_);
     StartFadeOut();
 }
 
 // ---------------------------------------------------------------------------
 // 网络一言（后台线程）
 // ---------------------------------------------------------------------------
-std::wstring HitokotoManager::FetchNetwork() {
+std::wstring HitokotoManager::FetchNetwork(const std::string& category) {
     std::wstring result;
     HINTERNET hSession = WinHttpOpen(L"Countdown/1.0",
                                      WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
@@ -193,8 +220,14 @@ std::wstring HitokotoManager::FetchNetwork() {
     HINTERNET hConnect = WinHttpConnect(hSession, L"v1.hitokoto.cn",
                                         INTERNET_DEFAULT_HTTPS_PORT, 0);
     if (hConnect) {
-        HINTERNET hReq = WinHttpOpenRequest(hConnect, L"GET",
-                                            L"/?charset=utf-8&encode=json",
+        // 句子类型：category 为空表示全部，不带 c 参数
+        std::wstring path = L"/?charset=utf-8&encode=json";
+        if (!category.empty()) {
+            path += L"&c=";
+            path += utils::Utf8ToWide(category);
+        }
+
+        HINTERNET hReq = WinHttpOpenRequest(hConnect, L"GET", path.c_str(),
                                             nullptr, WINHTTP_NO_REFERER,
                                             WINHTTP_DEFAULT_ACCEPT_TYPES,
                                             WINHTTP_FLAG_SECURE);
@@ -243,13 +276,38 @@ std::wstring HitokotoManager::FetchNetwork() {
 void HitokotoManager::StartNetwork() {
     if (netPending_.exchange(true)) return; // 已有请求在途
     HWND hwnd = hwnd_;
-    std::thread([hwnd]() {
-        std::wstring* result = new std::wstring(FetchNetwork());
+    std::string category = cfg_.hitokotoCategory;
+
+    std::thread([hwnd, category]() {
+        // 网络记录足够多时视为已看过一轮，清空后重新开始
+        if (history::SeenCount(history::Kind::NetworkHitokoto) >= kMaxNetworkHistory) {
+            history::Clear(history::Kind::NetworkHitokoto);
+        }
+
+        std::wstring result;
+        bool duplicate = false;
+        for (int attempt = 0; attempt < kMaxFetchRetries; ++attempt) {
+            result = FetchNetwork(category);
+            if (result.empty()) {
+                duplicate = false;
+                break; // 请求失败：交给主线程决定是否兜底
+            }
+            duplicate = history::IsSeen(history::Kind::NetworkHitokoto, result);
+            if (!duplicate) break; // 取到新句子
+            // 已显示过：重新获取
+        }
+        if (!result.empty()) {
+            // 连续多次都取到看过的句子，视为该类型已看完一轮：清空后重新开始
+            if (duplicate) history::Clear(history::Kind::NetworkHitokoto);
+            history::MarkSeen(history::Kind::NetworkHitokoto, result);
+        }
+
+        std::wstring* payload = new std::wstring(std::move(result));
         // 窗口可能已在请求期间销毁：PostMessage 失败时手动释放，
         // 避免堆分配字符串泄漏（成功时由主窗口 WM_APP_HITOKOTO 处理释放）
         if (!PostMessageW(hwnd, WM_APP_HITOKOTO, 0,
-                          reinterpret_cast<LPARAM>(result))) {
-            delete result;
+                          reinterpret_cast<LPARAM>(payload))) {
+            delete payload;
         }
     }).detach();
 }
