@@ -315,6 +315,19 @@ Config Config::Load() {
             }
             LoadColor(*cd, "backgroundColor", c.backgroundColor);
             LoadColor(*cd, "textColor", c.textColor);
+
+            int mode = IntValue(*cd, "sizeMode",
+                                static_cast<int>(c.countdownSizeMode));
+            if (mode < 0 || mode > 2) mode = 1;
+            c.countdownSizeMode = static_cast<CountdownSizeMode>(mode);
+            int cw = IntValue(*cd, "width", c.countdownWidth);
+            if (cw >= 200 && cw <= 4000) c.countdownWidth = cw;
+            int ch = IntValue(*cd, "height", c.countdownHeight);
+            if (ch >= 60 && ch <= 2000) c.countdownHeight = ch;
+            if (const J* v = cd->find("radius")) {
+                int r = static_cast<int>(v->as_number(-1));
+                if (r >= -1 && r <= 400) c.countdownRadius = r;
+            }
         }
 
         if (const J* hk = SubObject(root, "hitokoto")) {
@@ -434,6 +447,10 @@ bool Config::Save() const {
         cd.emplace_back("fontSize", J(fontSize));
         cd.emplace_back("backgroundColor", J(utils::ColorToHex(backgroundColor)));
         cd.emplace_back("textColor", J(utils::ColorToHex(textColor)));
+        cd.emplace_back("sizeMode", J(static_cast<int>(countdownSizeMode)));
+        cd.emplace_back("width", J(countdownWidth));
+        cd.emplace_back("height", J(countdownHeight));
+        cd.emplace_back("radius", J(countdownRadius));
         root.emplace_back("countdown", J(std::move(cd)));
     }
 

@@ -125,16 +125,23 @@ std::vector<std::wstring> LoadLocalFonts() {
     static std::set<std::wstring> systemFamilies;
     static bool baselineCaptured = false;
 
-    // 首次调用先记录系统原有字体，之后新增的字体族即视为本地字体
+    std::wstring dir = GetExeDir() + L"fonts";
+    EnsureDirectory(dir);
+    std::vector<std::wstring> files = ListFontFiles(dir);
+
+    // 没有本地字体文件时直接返回：枚举系统字体会明显拖慢启动
+    if (files.empty()) {
+        loadedFiles.clear();
+        return std::vector<std::wstring>(localFamilies.begin(),
+                                         localFamilies.end());
+    }
+
+    // 首次真正需要加载本地字体时，才记录系统原有字体作为基线
     if (!baselineCaptured) {
         auto sys = EnumerateSystemFonts();
         systemFamilies.insert(sys.begin(), sys.end());
         baselineCaptured = true;
     }
-
-    std::wstring dir = GetExeDir() + L"fonts";
-    EnsureDirectory(dir);
-    std::vector<std::wstring> files = ListFontFiles(dir);
 
     bool added = false;
     std::set<std::wstring> present;

@@ -1,3 +1,5 @@
 build/
+build-release/
+dist/
 
 .promotion/

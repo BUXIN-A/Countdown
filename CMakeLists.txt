@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(Countdown VERSION 2.2.0 LANGUAGES CXX)
+project(Countdown VERSION 2.3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -25,6 +25,7 @@ set(SOURCES
     src/article_window.cpp
     src/settings_window.cpp
     src/settings_module_config.cpp
+    src/update_dialog.cpp
     src/hitokoto.cpp
     src/tray.cpp
     resource.rc

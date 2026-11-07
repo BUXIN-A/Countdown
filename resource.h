@@ -99,6 +99,9 @@
 #define IDC_STATIC_MODULE_HINT     3065
 // 关于页
 #define IDC_BTN_UPDATE             3066
+// 倒计时窗口尺寸与圆角
+#define IDC_EDIT_CD_WIDTH          3067
+#define IDC_EDIT_CD_HEIGHT         3068
 // 设置页标签
 #define IDC_TAB_MAIN               3030
 

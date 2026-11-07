@@ -45,6 +45,13 @@ enum class ArticleSizeMode {
     Custom = 2,               // 手动指定宽高
 };
 
+// 倒计时窗口尺寸模式
+enum class CountdownSizeMode {
+    AutoHeight = 0, // 宽度手动指定、高度随内容
+    AutoFit    = 1, // 宽高都随文本/内容计算（默认，保持原有外观）
+    Custom     = 2, // 宽高都手动指定
+};
+
 // 临时数据清理逻辑：按记录项数 / 按文件大小
 enum class TempCleanupMode {
     Count = 0,
@@ -91,6 +98,13 @@ struct Config {
     std::wstring font = L"";          // 倒计时信息字体
     COLORREF     backgroundColor = RGB(20, 20, 30);  // 倒计时背景
     COLORREF     textColor = RGB(235, 235, 245);      // 倒计时文字
+
+    // ---- countdown：窗口尺寸与圆角 ----
+    CountdownSizeMode countdownSizeMode = CountdownSizeMode::AutoFit;
+    int          countdownWidth = 560;   // 96 DPI 逻辑像素
+    int          countdownHeight = 110;  // 96 DPI 逻辑像素
+    // 圆角半径（96 DPI 逻辑像素）；-1 表示胶囊（自动取高度的一半）
+    int          countdownRadius = -1;
 
     // ---- hitokoto ----
     HitokotoSource hitokotoSource = HitokotoSource::Both;

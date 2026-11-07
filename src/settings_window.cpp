@@ -14,6 +14,7 @@
 #include "hitokoto_category.h"
 #include "json.h"
 #include "settings_module_config.h"
+#include "update_dialog.h"
 #include "utils.h"
 #include "version.h"
 
@@ -98,6 +99,8 @@ enum DropdownKind {
     DropTempMode,
     DropTempUnit,
     DropTempTrim,
+    DropCdSizeMode,
+    DropCdRadius,
 };
 
 struct DropdownDef {
@@ -195,6 +198,11 @@ struct SettingsState {
     HWND hBtnStart = nullptr;
     HWND hBtnFormat = nullptr;
     HWND hEditSize = nullptr;
+    HWND hBtnCdSize = nullptr;
+    HWND hEditCdWidth = nullptr;
+    HWND hEditCdHeight = nullptr;
+    int  cdWidthFieldIndex = -1;
+    int  cdHeightFieldIndex = -1;
     HWND hBtnBgColor = nullptr;
     HWND hBtnTextColor = nullptr;
     HWND hBtnHkSrc = nullptr;
@@ -367,6 +375,37 @@ static std::vector<std::wstring> TempTrimItems() {
     return { L"\u6e05\u7a7a\u5168\u90e8", L"\u5220\u9664\u6700\u65e9 N \u9879" };
 }
 
+// 倒计时窗口尺寸模式：0 高度自适应 / 1 全自适应 / 2 自定义
+static std::vector<std::wstring> CdSizeModeItems() {
+    return {
+        L"\u9ad8\u5ea6\u81ea\u9002\u5e94", // 高度自适应
+        L"\u5168\u81ea\u9002\u5e94",     // 全自适应
+        L"\u81ea\u5b9a\u4e49",           // 自定义
+    };
+}
+
+// 圆角候选值：-1 表示自动（胶囊），其余为像素值
+static const int kCdRadiusValues[] = {-1, 0, 4, 8, 12, 16, 20, 24, 32, 40, 48, 60};
+static const int kCdRadiusCount =
+    static_cast<int>(sizeof(kCdRadiusValues) / sizeof(kCdRadiusValues[0]));
+
+static std::vector<std::wstring> CdRadiusItems() {
+    std::vector<std::wstring> items;
+    items.push_back(L"\u81ea\u52a8\uff08\u80f6\u56ca\uff09"); // 自动（胶囊）
+    items.push_back(L"0\uff08\u76f4\u89d2\uff09");           // 0（直角）
+    for (int i = 2; i < kCdRadiusCount; ++i) {
+        items.push_back(std::to_wstring(kCdRadiusValues[i]));
+    }
+    return items;
+}
+
+static int CdRadiusIndex(int value) {
+    for (int i = 0; i < kCdRadiusCount; ++i) {
+        if (kCdRadiusValues[i] == value) return i;
+    }
+    return 0;
+}
+
 static bool ParseIntField(HWND edit, int& out) {
     wchar_t buf[256] = {0};
     GetWindowTextW(edit, buf, 256);
@@ -491,6 +530,22 @@ static void UpdateTempControls(SettingsState* st) {
     }
 }
 
+// 按尺寸模式启用/禁用宽度与高度输入：全自适应时两者都不需要
+static void UpdateCountdownSizeControls(SettingsState* st) {
+    if (!st) return;
+    bool manualW = st->cfg.countdownSizeMode != CountdownSizeMode::AutoFit;
+    bool manualH = st->cfg.countdownSizeMode == CountdownSizeMode::Custom;
+    auto enableField = [&](int index, bool on) {
+        if (index < 0 || index >= static_cast<int>(st->numbers.size())) return;
+        NumberField& f = st->numbers[index];
+        EnableWindow(f.minus, on);
+        EnableWindow(f.edit, on);
+        EnableWindow(f.plus, on);
+    };
+    enableField(st->cdWidthFieldIndex, manualW);
+    enableField(st->cdHeightFieldIndex, manualH);
+}
+
 static void UpdateModuleHint(SettingsState* st) {
     if (!st || !st->hModuleHint) return;
     const ArticleModuleEntry* entry =
@@ -569,6 +624,14 @@ static void ApplyDropdownSelection(SettingsState* st, DropdownDef* def, int inde
             st->cfg.tempTrimMode = index == 1
                 ? TempTrimMode::DropOldest : TempTrimMode::ClearAll;
             UpdateTempControls(st);
+            break;
+        case DropCdSizeMode:
+            st->cfg.countdownSizeMode = static_cast<CountdownSizeMode>(index);
+            UpdateCountdownSizeControls(st);
+            break;
+        case DropCdRadius:
+            st->cfg.countdownRadius =
+                (index >= 0 && index < kCdRadiusCount) ? kCdRadiusValues[index] : -1;
             break;
     }
     SetWindowTextW(def->trigger, def->items[index].c_str());
@@ -2293,6 +2356,38 @@ static void OnCreate(HWND hwnd, SettingsState* st) {
             divider(page, rowY); y += st->S(kRowStep);
         }
 
+        section(page, y, L"\u7a97\u53e3\u5c3a\u5bf8"); // 窗口尺寸
+        {
+            int rowY = y;
+            label(L"\u5927\u5c0f\u6a21\u5f0f", rowY, page);
+            st->hBtnCdSize = dropdown(page, makeSlots(rowY, {170})[0],
+                                      DropCdSizeMode, CdSizeModeItems(),
+                                      static_cast<int>(st->cfg.countdownSizeMode));
+            divider(page, rowY); y += st->S(kRowStep);
+
+            rowY = y;
+            label(L"\u5bbd\u5ea6\uff08\u50cf\u7d20\uff09", rowY, page);
+            st->hEditCdWidth = stepper(page, makeSlots(rowY, {110})[0],
+                                       intText(st->cfg.countdownWidth).c_str(),
+                                       IDC_EDIT_CD_WIDTH, 200, 4000, ES_NUMBER);
+            st->cdWidthFieldIndex = static_cast<int>(st->numbers.size()) - 1;
+            divider(page, rowY); y += st->S(kRowStep);
+
+            rowY = y;
+            label(L"\u9ad8\u5ea6\uff08\u50cf\u7d20\uff09", rowY, page);
+            st->hEditCdHeight = stepper(page, makeSlots(rowY, {110})[0],
+                                        intText(st->cfg.countdownHeight).c_str(),
+                                        IDC_EDIT_CD_HEIGHT, 60, 2000, ES_NUMBER);
+            st->cdHeightFieldIndex = static_cast<int>(st->numbers.size()) - 1;
+            divider(page, rowY); y += st->S(kRowStep);
+
+            rowY = y;
+            label(L"\u5706\u89d2", rowY, page);
+            dropdown(page, makeSlots(rowY, {170})[0], DropCdRadius,
+                     CdRadiusItems(), CdRadiusIndex(st->cfg.countdownRadius));
+            divider(page, rowY); y += st->S(kRowStep);
+        }
+
         section(page, y, L"\u4e00\u8a00"); // 一言
         {
             int rowY = y;
@@ -2543,6 +2638,7 @@ static void OnCreate(HWND hwnd, SettingsState* st) {
     UpdateTempLabels(st);
     UpdateTempControls(st);
     UpdateModuleHint(st);
+    UpdateCountdownSizeControls(st);
 
     // 页面内容高度取控件底部
     for (int i = 0; i < kTabCount; ++i) {
@@ -2641,6 +2737,24 @@ static bool CollectAndValidate(HWND hwnd, SettingsState* st) {
                          L"\u5b57\u53f7\u5e94\u5728 8\u2013200 \u4e4b\u95f4");
     }
     st->cfg.fontSize = size;
+
+    // 倒计时窗口尺寸：仅在校验所需时读取，全自适应下的输入框不参与
+    if (st->cfg.countdownSizeMode != CountdownSizeMode::AutoFit) {
+        int cdW = 0;
+        if (!ParseIntField(st->hEditCdWidth, cdW) || cdW < 200 || cdW > 4000) {
+            return ShowError(st, hwnd, PageCountdown, st->hEditCdWidth,
+                             L"\u5bbd\u5ea6\u5e94\u5728 200\u20134000 \u4e4b\u95f4");
+        }
+        st->cfg.countdownWidth = cdW;
+    }
+    if (st->cfg.countdownSizeMode == CountdownSizeMode::Custom) {
+        int cdH = 0;
+        if (!ParseIntField(st->hEditCdHeight, cdH) || cdH < 60 || cdH > 2000) {
+            return ShowError(st, hwnd, PageCountdown, st->hEditCdHeight,
+                             L"\u9ad8\u5ea6\u5e94\u5728 60\u20132000 \u4e4b\u95f4");
+        }
+        st->cfg.countdownHeight = cdH;
+    }
 
     int hkSec = 0;
     if (!ParseIntField(st->hEditHkRefresh, hkSec) || hkSec < 5 || hkSec > 3600) {
@@ -2973,10 +3087,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
                     return 0;
 
                 case IDC_BTN_UPDATE:
-                    if (code == BN_CLICKED) {
-                        ShellExecuteW(nullptr, L"open", APP_UPDATE_URL,
-                                      nullptr, nullptr, SW_SHOWNORMAL);
-                    }
+                    if (code == BN_CLICKED) ShowUpdateWindow(hwnd);
                     return 0;
 
                 case IDC_BTN_TEMP_CLEAN:

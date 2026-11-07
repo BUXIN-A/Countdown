@@ -278,8 +278,12 @@ void CountdownWindow::ApplyRoundedRegion() {
     GetClientRect(hwnd_, &rc);
     int w = rc.right - rc.left;
     int h = rc.bottom - rc.top;
-    // 圆角半径 = 高度的一半，得到胶囊形
-    int r = h / 2;
+    if (w <= 0 || h <= 0) return;
+    // 圆角值直接作为圆角椭圆直径；-1（自动）取高度的一半，即胶囊形
+    int r = config_.countdownRadius < 0 ? h / 2
+                                        : S(config_.countdownRadius);
+    if (r < 0) r = 0;
+    if (r > h) r = h;
     HRGN rgn = CreateRoundRectRgn(0, 0, w, h, r, r);
     SetWindowRgn(hwnd_, rgn, TRUE);
 }
@@ -325,15 +329,35 @@ void CountdownWindow::Reposition() {
     int textW = MeasureTextWidth(fContent_, content);
     textW = std::max(textW, MeasureTextWidth(fTitle_, config_.title));
     textW = std::max(textW, MeasureTextWidth(fTarget_, target));
-    int w = textW + S(60);
-    w = std::max(w, S(560));
-    // 工作区过窄时不再收缩，避免 work_w-16 为负导致窗口反向溢出
-    if (work_w > S(34)) w = std::min(w, work_w - S(16));
 
-    // 窗口高度：标题 + 倒计时大字 + 目标时间 + 一言区域（最多 2 行）
-    int h = S(6) + (TitleFontPx() + S(4)) + (ContentFontPx() + S(4))
-            + S(16) + S(2) + (2 * HkBaseFontPx() + S(6)) + S(4);
-    h = std::max(h, S(80));
+    // 内容所需高度：标题 + 倒计时大字 + 目标时间 + 一言区域（最多 2 行）
+    int contentH = S(6) + (TitleFontPx() + S(4)) + (ContentFontPx() + S(4))
+                   + S(16) + S(2) + (2 * HkBaseFontPx() + S(6)) + S(4);
+    contentH = std::max(contentH, S(80));
+
+    int w = 0;
+    int h = 0;
+    switch (config_.countdownSizeMode) {
+        case CountdownSizeMode::AutoHeight:
+            // 宽度手动指定，高度随内容
+            w = S(std::max(200, config_.countdownWidth));
+            h = contentH;
+            break;
+        case CountdownSizeMode::Custom:
+            // 宽高都手动指定
+            w = S(std::max(200, config_.countdownWidth));
+            h = std::max(S(60), S(config_.countdownHeight));
+            break;
+        case CountdownSizeMode::AutoFit:
+        default:
+            // 宽度按实际文本像素宽度计算，避免中文单位被裁切
+            w = std::max(textW + S(60), S(560));
+            h = contentH;
+            break;
+    }
+    // 工作区过窄/过矮时收缩，避免 work_w-16 为负导致窗口反向溢出
+    if (work_w > S(34)) w = std::min(w, work_w - S(16));
+    if (work_h > S(34)) h = std::min(h, work_h - S(16));
 
     // 锚点模板：按水平/垂直分量分别取基准位置，再叠加用户偏移
     int x, y;
@@ -419,11 +443,14 @@ void DrawTextCentered(HDC dc, const std::wstring& text,
 }
 } // namespace
 
-// 一言区域（窗口客户区坐标）：目标时间下方，高度最多 2 行
+// 一言区域（窗口客户区坐标）：目标时间下方，占据剩余高度。
+// AutoFit 模式下窗口高度正好等于该区域需要的高度，行为与原来一致；
+// 手动指定尺寸时区域随之变大，一言字号会自动放大填满。
 RECT CountdownWindow::HitokotoRect(int w, int h) const {
     int top = S(6) + (TitleFontPx() + S(4)) + (ContentFontPx() + S(4))
               + S(16) + S(2);
-    int bottom = std::min(h - S(4), top + 2 * HkBaseFontPx() + S(6));
+    int bottom = h - S(4);
+    if (bottom < top) bottom = top;
     return {S(8), top, w - S(8), bottom};
 }
 
@@ -459,8 +486,11 @@ void CountdownWindow::DrawHitokoto(HDC mem, int w, int h,
     if (fHk_ && hk == lastHkText_ && fHkBoxW_ == availW && fHkBoxH_ == maxH) {
         f = fHk_; // 文本与可用区域未变：直接复用缓存字体
     } else {
-        // 文本变化：从基准字号向下试探，选择能放下的最大字号并缓存
-        int size = std::max(11, config_.fontSize / 2);
+        // 文本变化：以区域允许的最大字号为起点向下试探，选择能放下的最大字号并缓存。
+        // 大窗口（手动指定尺寸）下起始字号随之放大，实现一言字号自动缩放。
+        int scale = std::max(1, S(1));
+        int size = std::max(maxH / (2 * scale), std::max(11, config_.fontSize / 2));
+        if (size > 240) size = 240;
         while (size >= 10) {
             // 使用灰度抗锯齿：文本层像素与文本色成线性关系，便于还原 alpha
             HFONT tmp = CreateFontW(-S(size), 0, 0, 0, weight, FALSE, FALSE, FALSE,
@@ -675,7 +705,9 @@ void CountdownWindow::Render() {
     BYTE* base = static_cast<BYTE*>(dib_bits_);
 
     // 背景：以配置色为基准做轻微渐变（顶部略亮、底部略暗）
-    int rr = h / 2;
+    int rr = (config_.countdownRadius < 0) ? h / 2 : S(config_.countdownRadius);
+    if (rr < 0) rr = 0;
+    if (rr > h) rr = h;
     COLORREF bg = config_.backgroundColor;
     COLORREF bgTop = utils::BlendColor(bg, RGB(255, 255, 255), 0.07f);
     COLORREF bgBottom = utils::BlendColor(bg, RGB(0, 0, 0), 0.12f);
@@ -820,6 +852,9 @@ void CountdownWindow::ApplyConfig(const Config& cfg) {
     Reposition(); // 字号/一言区域可能变化，需重新布局
     article_.ApplyConfig(cfg); // 一文开关/位置/刷新配置
     RebuildSchedules(schedule::Scheduler::Now());
+    // 立即重绘一次，避免等待下一个定时器周期才看到新外观
+    Render();
+    UpdateWindow(hwnd_);
 }
 
 // ---------------------------------------------------------------------------
