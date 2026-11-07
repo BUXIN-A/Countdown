@@ -118,6 +118,7 @@ struct SharedState {
     bool                     dlOk = false;
     bool                     dlCancelled = false;
     std::wstring             dlPath;
+    std::wstring             dlPartialPath; // 正在写入的临时文件，取消/失败时删除
     std::wstring             dlError;
     int                      progress = 0;
 };
@@ -514,6 +515,21 @@ static void DoCheckUpdates(std::shared_ptr<SharedState> shared) {
     if (hwnd) PostMessageW(hwnd, WM_UPDATE_CHECK_DONE, 0, 0);
 }
 
+// 删除未完成的下载文件：句柄刚关闭时可能被杀软/索引服务短暂占用，做有限重试
+static void RemoveFileBestEffort(const std::wstring& path) {
+    if (path.empty()) return;
+    for (int attempt = 0; attempt < 6; ++attempt) {
+        if (DeleteFileW(path.c_str())) return;
+        DWORD err = GetLastError();
+        if (err == ERROR_FILE_NOT_FOUND) return;
+        if (err != ERROR_ACCESS_DENIED && err != ERROR_SHARING_VIOLATION &&
+            err != ERROR_LOCK_VIOLATION) {
+            return;
+        }
+        Sleep(60);
+    }
+}
+
 // 后台：下载附件到指定路径
 static void DoDownloadAsset(std::shared_ptr<SharedState> shared,
                             std::wstring url, std::wstring path) {
@@ -538,6 +554,10 @@ static void DoDownloadAsset(std::shared_ptr<SharedState> shared,
         if (file == INVALID_HANDLE_VALUE) {
             error = L"无法写入下载目录";
             break;
+        }
+        {
+            std::lock_guard<std::mutex> lock(shared->mtx);
+            shared->dlPartialPath = path;
         }
 
         long long written = 0;
@@ -600,7 +620,15 @@ static void DoDownloadAsset(std::shared_ptr<SharedState> shared,
         CloseHandle(file);
         file = INVALID_HANDLE_VALUE;
     }
-    if (!ok) DeleteFileW(path.c_str());
+    if (ok) {
+        std::lock_guard<std::mutex> lock(shared->mtx);
+        shared->dlPartialPath.clear();
+    } else {
+        // 取消或失败：删除未下载完成的文件
+        RemoveFileBestEffort(path);
+        std::lock_guard<std::mutex> lock(shared->mtx);
+        shared->dlPartialPath.clear();
+    }
 
     {
         std::lock_guard<std::mutex> lock(shared->mtx);
@@ -1077,6 +1105,7 @@ static void ResetShared(UpdateState* st) {
     st->shared->dlOk = false;
     st->shared->dlCancelled = false;
     st->shared->dlPath.clear();
+    st->shared->dlPartialPath.clear();
     st->shared->dlError.clear();
     st->shared->progress = 0;
 }
@@ -1415,14 +1444,19 @@ static LRESULT CALLBACK UpdateWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             bool ok = false;
             bool cancelled = false;
             std::wstring path;
+            std::wstring partial;
             std::wstring error;
             {
                 std::lock_guard<std::mutex> lock(st->shared->mtx);
                 ok = st->shared->dlOk;
                 cancelled = st->shared->dlCancelled;
                 path = st->shared->dlPath;
+                partial = st->shared->dlPartialPath;
+                st->shared->dlPartialPath.clear();
                 error = st->shared->dlError;
             }
+            // worker 未能删除时（偶发占用）在这里再兜底删除一次
+            if (!ok && !partial.empty()) RemoveFileBestEffort(partial);
             if (cancelled) {
                 st->stage = UpdateStage::Assets;
             } else if (ok) {
