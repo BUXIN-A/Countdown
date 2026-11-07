@@ -24,11 +24,11 @@ public:
     // 初始化：绑定窗口句柄、加载本地语句列表
     void Init(HWND hwnd, const Config& cfg);
 
-    // 配置变化（来源/刷新间隔）后立即按新配置获取一句
+    // 配置变化（来源/字体等）后立即按新配置获取一句
     void ApplyConfig(const Config& cfg);
 
-    // 每帧调用：推进切换动画 + 检查刷新周期
-    void Tick();
+    // 每帧调用：只推进渐隐/渐显动画（刷新由主窗口计划表驱动）
+    void Tick(DWORD now);
 
     // 立即获取下一句（首次启动、配置变更后使用）
     void FetchNext();
@@ -68,6 +68,5 @@ private:
     float fade_ = 255.0f;               // 当前透明度 0~255
     DWORD lastAnim_ = 0;
 
-    DWORD lastFetch_ = 0;               // 上次获取时刻（GetTickCount）
     std::atomic<bool> netPending_{false}; // 网络请求是否在途
 };

@@ -17,6 +17,7 @@
 #include <stdexcept>
 #include <cstdlib>
 #include <cmath>
+#include <cctype>
 #include <cwctype>
 
 namespace mini_json {
@@ -41,6 +42,8 @@ public:
     Type type() const { return type_; }
     bool is_null() const { return type_ == Type::Null; }
     bool is_object() const { return type_ == Type::Object; }
+    bool is_array() const { return type_ == Type::Array; }
+    bool is_string() const { return type_ == Type::String; }
 
     // 对象访问
     const Value* find(const std::string& key) const {
@@ -48,7 +51,9 @@ public:
         for (const auto& kv : obj_) if (kv.first == key) return &kv.second;
         return nullptr;
     }
-    const std::string& as_string(const std::string& fallback = "") const {
+    const Object& as_object() const { return obj_; }
+    const Array& as_array() const { return arr_; }
+    std::string as_string(const std::string& fallback = "") const {
         return (type_ == Type::String) ? str_ : fallback;
     }
     double as_number(double fallback = 0.0) const {
@@ -326,13 +331,35 @@ private:
         }
 
         Value parse_number() {
+            // 严格按 JSON 数字语法解析，拒绝 "1-2"、"1e" 这类前缀可被
+            // std::stod 接受但实际非法的输入
             size_t start = i;
             if (peek() == '-') ++i;
-            while (!at_end()) {
-                char c = s[i];
-                if ((c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-') {
-                    ++i;
-                } else break;
+            if (!std::isdigit(static_cast<unsigned char>(peek()))) {
+                throw std::runtime_error("mini_json: bad number");
+            }
+            if (peek() == '0') {
+                ++i; // 0 后不能紧跟数字（JSON 不允许前导零）
+                if (std::isdigit(static_cast<unsigned char>(peek()))) {
+                    throw std::runtime_error("mini_json: leading zero");
+                }
+            } else {
+                while (std::isdigit(static_cast<unsigned char>(peek()))) ++i;
+            }
+            if (peek() == '.') {
+                ++i;
+                if (!std::isdigit(static_cast<unsigned char>(peek()))) {
+                    throw std::runtime_error("mini_json: bad fraction");
+                }
+                while (std::isdigit(static_cast<unsigned char>(peek()))) ++i;
+            }
+            if (peek() == 'e' || peek() == 'E') {
+                ++i;
+                if (peek() == '+' || peek() == '-') ++i;
+                if (!std::isdigit(static_cast<unsigned char>(peek()))) {
+                    throw std::runtime_error("mini_json: bad exponent");
+                }
+                while (std::isdigit(static_cast<unsigned char>(peek()))) ++i;
             }
             std::string num = s.substr(start, i - start);
             try {

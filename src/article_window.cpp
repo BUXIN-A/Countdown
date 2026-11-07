@@ -2,6 +2,7 @@
 // article_window.cpp - 一文栏目实现
 // =============================================================================
 #include "article_window.h"
+#include "article_module_api.h"
 #include "history.h"
 #include "utils.h"
 
@@ -27,8 +28,7 @@ static const wchar_t* kDefaultArticleText = LR"(《破土》
 遇到难题，别急着否定自己，先把它拆小；遇到失败，别只顾沮丧，先记录原因。别等状态好了才行动，很多时候，是行动带来了状态。
 和昨天的自己比，不和别人的高光比。把目标写下来，把任务做到底。你现在的坚持，也许暂时看不见结果，但会在某一天连成台阶，托你走向更高的地方。慢一点没关系，别停就好。)";
 
-// 正文内边距（96 DPI 逻辑像素）：布局测量与绘制必须共用同一组值，
-// 否则会出现“按 22 算高度、按 20 裁切”，最后一行被切掉
+// 正文内边距（96 DPI 逻辑像素）：布局测量与绘制共用同一组值
 static const int kArticlePadX = 22;
 static const int kArticlePadY = 20;
 
@@ -40,7 +40,6 @@ static void TrimWhitespace(std::wstring& s) {
     s = s.substr(begin, end - begin);
 }
 
-// 同一文件内用 /*/ 分隔多篇文章
 static void SplitArticles(const std::wstring& text,
                           std::vector<std::wstring>& out) {
     static const std::wstring kSep = L"/*/";
@@ -57,16 +56,51 @@ static void SplitArticles(const std::wstring& text,
     }
 }
 
-// 随机数生成器（以时间 + 启动时刻播种）
-static std::mt19937& Rng() {
-    static std::mt19937 gen(
-        static_cast<unsigned>(std::time(nullptr)) ^
-        static_cast<unsigned>(GetTickCount()));
-    return gen;
+// ---------------------------------------------------------------------------
+// 模块宿主回调
+// ---------------------------------------------------------------------------
+namespace {
+
+ArticleWindow* HostOf(void* host) {
+    return static_cast<ArticleWindow*>(host);
 }
 
-// ---------------------------------------------------------------------------
-// 窗口类
+int HostArticleCount(void* host) {
+    return HostOf(host)->ModuleArticleCount();
+}
+
+const char* HostArticleKey(void* host, int index) {
+    return HostOf(host)->ModuleArticleKey(index);
+}
+
+int HostIsSeen(void* host, const char* key) {
+    return HostOf(host)->ModuleIsSeen(key) ? 1 : 0;
+}
+
+void HostMarkSeen(void* host, const char* key) {
+    HostOf(host)->ModuleMarkSeen(key);
+}
+
+void HostClearSeen(void* host) {
+    HostOf(host)->ModuleClearSeen();
+}
+
+const wchar_t* HostTempDir(void* host) {
+    return HostOf(host)->ModuleTempDir();
+}
+
+void HostLocalTime(void* host, int* year, int* month, int* day,
+                   int* weekday, int* hour, int* minute, int* second) {
+    HostOf(host)->ModuleLocalTime(year, month, day, weekday,
+                                  hour, minute, second);
+}
+
+unsigned int HostRandomU32(void* host) {
+    return HostOf(host)->ModuleRandomU32();
+}
+
+} // namespace
+
 // ---------------------------------------------------------------------------
 bool ArticleWindow::RegisterClass(HINSTANCE hInst) {
     WNDCLASSEXW exist{};
@@ -85,6 +119,19 @@ bool ArticleWindow::RegisterClass(HINSTANCE hInst) {
 
 bool ArticleWindow::Create(HINSTANCE hInst, HWND main) {
     main_ = main;
+
+    // 模块宿主 API：函数指针固定，host 指向本窗口
+    moduleHost_.abi_version = ARTICLE_MODULE_ABI_VERSION;
+    moduleHost_.host = this;
+    moduleHost_.article_count = &HostArticleCount;
+    moduleHost_.article_key = &HostArticleKey;
+    moduleHost_.is_seen = &HostIsSeen;
+    moduleHost_.mark_seen = &HostMarkSeen;
+    moduleHost_.clear_seen = &HostClearSeen;
+    moduleHost_.temp_dir = &HostTempDir;
+    moduleHost_.local_time = &HostLocalTime;
+    moduleHost_.random_u32 = &HostRandomU32;
+
     hwnd_ = CreateWindowExW(
         WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
         ClassName(), L"", WS_POPUP, 0, 0, 0, 0,
@@ -93,6 +140,8 @@ bool ArticleWindow::Create(HINSTANCE hInst, HWND main) {
 }
 
 void ArticleWindow::Destroy() {
+    StopAnimation();
+    module_.Destroy();
     if (hwnd_) {
         DestroyWindow(hwnd_);
         hwnd_ = nullptr;
@@ -127,7 +176,6 @@ LRESULT ArticleWindow::Handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_ERASEBKGND:
             return 1;
         case WM_WINDOWPOSCHANGING: {
-            // 一文的置顶独立于倒计时；开启时强制保持 TOPMOST
             auto* pwp = reinterpret_cast<WINDOWPOS*>(lp);
             if (cfg_.articleIsTop && (pwp->flags & SWP_NOZORDER) == 0) {
                 pwp->hwndInsertAfter = HWND_TOPMOST;
@@ -154,6 +202,58 @@ LRESULT ArticleWindow::Handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 // ---------------------------------------------------------------------------
+// 模块宿主实现
+// ---------------------------------------------------------------------------
+int ArticleWindow::ModuleArticleCount() const {
+    return static_cast<int>(articles_.size());
+}
+
+const char* ArticleWindow::ModuleArticleKey(int index) const {
+    if (index < 0 || index >= static_cast<int>(articleKeys_.size())) return "";
+    return articleKeys_[index].c_str();
+}
+
+bool ArticleWindow::ModuleIsSeen(const char* key) const {
+    if (!key || !key[0]) return false;
+    return history::IsSeenKey(history::Kind::Article, key);
+}
+
+void ArticleWindow::ModuleMarkSeen(const char* key) {
+    if (!key || !key[0]) return;
+    history::MarkSeenKey(history::Kind::Article, key);
+}
+
+void ArticleWindow::ModuleClearSeen() {
+    history::Clear(history::Kind::Article);
+}
+
+const wchar_t* ArticleWindow::ModuleTempDir() const {
+    return history::TempDir().c_str();
+}
+
+void ArticleWindow::ModuleLocalTime(int* year, int* month, int* day,
+                                    int* weekday, int* hour, int* minute,
+                                    int* second) {
+    std::time_t now = std::time(nullptr);
+    std::tm t{};
+    localtime_s(&t, &now);
+    if (year)    *year = t.tm_year + 1900;
+    if (month)   *month = t.tm_mon + 1;
+    if (day)     *day = t.tm_mday;
+    if (weekday) *weekday = (t.tm_wday == 0) ? 7 : t.tm_wday; // 1=周一
+    if (hour)    *hour = t.tm_hour;
+    if (minute)  *minute = t.tm_min;
+    if (second)  *second = t.tm_sec;
+}
+
+unsigned int ArticleWindow::ModuleRandomU32() {
+    static std::mt19937 gen(
+        static_cast<unsigned>(std::time(nullptr)) ^
+        static_cast<unsigned>(GetTickCount()));
+    return gen();
+}
+
+// ---------------------------------------------------------------------------
 // 配置与文章加载
 // ---------------------------------------------------------------------------
 void ArticleWindow::ApplyConfig(const Config& cfg) {
@@ -163,34 +263,35 @@ void ArticleWindow::ApplyConfig(const Config& cfg) {
     if (!cfg_.articleEnabled) {
         StopAnimation();
         ShowWindow(hwnd_, SW_HIDE);
+        hasArticle_ = false;
         return;
     }
 
-    size_t prevIndex = index_;
     LoadArticles();
-    lastSwitch_ = GetTickCount();
     if (articles_.empty()) {
+        StopAnimation();
+        ShowWindow(hwnd_, SW_HIDE);
+        hasArticle_ = false;
+        return;
+    }
+    if (hasArticle_ && index_ >= articles_.size()) hasArticle_ = false;
+
+    bool changed = SelectArticle(hasArticle_ ? ARTICLE_SELECT_CONFIG
+                                             : ARTICLE_SELECT_STARTUP);
+    if (!hasArticle_) {
         StopAnimation();
         ShowWindow(hwnd_, SW_HIDE);
         return;
     }
-
-    if (firstPick_) {
-        // 首次显示：随机选一篇没看过的
-        index_ = PickRandomUnseen();
-        firstPick_ = false;
-    } else if (prevIndex < articles_.size()) {
-        // 配置变更时保持当前这篇，不突然换文
-        index_ = prevIndex;
-    } else {
-        index_ = PickRandomUnseen();
-    }
-    history::MarkSeen(history::Kind::Article, articles_[index_]);
+    // 配置变化（字体/颜色/尺寸/模块）都需要重新布局
+    (void)changed;
     Reposition();
 }
 
 void ArticleWindow::LoadArticles() {
     articles_.clear();
+    articleKeys_.clear();
+
     std::wstring dir = utils::GetExeDir() + L"article";
     utils::EnsureDirectory(dir);
 
@@ -202,11 +303,14 @@ void ArticleWindow::LoadArticles() {
 
     for (const auto& file : files) {
         std::wstring text;
-        // 单个文章文件上限 1MB
         if (!utils::ReadTextFile(file, text, 1024 * 1024)) continue;
-        // 统一换行，避免 CRLF 影响按行测量
         text.erase(std::remove(text.begin(), text.end(), L'\r'), text.end());
         SplitArticles(text, articles_);
+    }
+
+    articleKeys_.reserve(articles_.size());
+    for (const auto& article : articles_) {
+        articleKeys_.push_back(history::KeyOfText(article));
     }
 }
 
@@ -216,16 +320,92 @@ void ArticleWindow::CreateDefaultFile() {
     utils::WriteTextFile(dir + L"\\default.txt", kDefaultArticleText);
 }
 
-void ArticleWindow::Tick() {
-    if (!hwnd_ || !cfg_.articleEnabled || articles_.size() <= 1) return;
-    if (!IsWindowVisible(hwnd_)) return;
-    if (cfg_.articleRefreshSec <= 0) return;
+// ---------------------------------------------------------------------------
+// 选择文章
+// ---------------------------------------------------------------------------
+bool ArticleWindow::SelectArticle(int reason) {
+    if (articles_.empty()) {
+        hasArticle_ = false;
+        return false;
+    }
 
-    DWORD now = GetTickCount();
-    if (now - lastSwitch_ >= static_cast<DWORD>(cfg_.articleRefreshSec) * 1000) {
-        lastSwitch_ = now;
-        AdvanceRandom();
-        Reposition(); // 文章长度不同，需重新计算高度
+    bool oldHas = hasArticle_;
+    size_t oldIndex = index_;
+
+    const ArticleModuleEntry* entry =
+        ArticleModuleRegistry::Instance().Find(cfg_.articleModule);
+
+    if (entry) {
+        if (!module_.Valid() || moduleId_ != entry->id) {
+            module_.Destroy();
+            moduleId_.clear();
+            if (module_.Create(*entry, &moduleHost_)) {
+                moduleId_ = entry->id;
+            }
+        }
+        if (module_.Valid()) {
+            module_.ApplyConfig(cfg_.ArticleModuleConfig(entry->id));
+            int picked = module_.Select(hasArticle_ ? static_cast<int>(index_) : -1,
+                                        reason);
+            if (picked >= 0 && picked < static_cast<int>(articles_.size())) {
+                index_ = static_cast<size_t>(picked);
+                hasArticle_ = true;
+                MarkCurrentSeen();
+            } else {
+                // week 模块在某天不属于任何时间段时返回 -1：隐藏一文
+                hasArticle_ = false;
+            }
+            return oldHas != hasArticle_ || (hasArticle_ && oldIndex != index_);
+        }
+    }
+
+    // ---- 内置回退：模块缺失/加载失败 ----
+    module_.Destroy();
+    moduleId_.clear();
+
+    if (reason != ARTICLE_SELECT_REFRESH && hasArticle_) {
+        MarkCurrentSeen();
+        return false;
+    }
+    if (reason != ARTICLE_SELECT_REFRESH) {
+        index_ = PickRandomUnseen();
+    } else {
+        size_t next = AdvanceRandom();
+        if (next == index_ && articles_.size() > 1) next = PickRandomUnseen();
+        index_ = next;
+    }
+    hasArticle_ = true;
+    MarkCurrentSeen();
+    return oldHas != hasArticle_ || oldIndex != index_;
+}
+
+void ArticleWindow::MarkCurrentSeen() {
+    if (!hasArticle_ || index_ >= articleKeys_.size()) return;
+    history::MarkSeenKey(history::Kind::Article, articleKeys_[index_]);
+}
+
+void ArticleWindow::RefreshNow() {
+    if (!hwnd_ || !cfg_.articleEnabled || articles_.empty()) return;
+    bool changed = SelectArticle(ARTICLE_SELECT_REFRESH);
+    if (changed) {
+        if (hasArticle_) {
+            Reposition();
+        } else {
+            StopAnimation();
+            ShowWindow(hwnd_, SW_HIDE);
+        }
+    }
+}
+
+void ArticleWindow::RefreshForDayChange() {
+    if (!hwnd_ || !cfg_.articleEnabled || articles_.empty()) return;
+    bool changed = SelectArticle(ARTICLE_SELECT_CONFIG);
+    if (changed) {
+        if (hasArticle_) Reposition();
+        else {
+            StopAnimation();
+            ShowWindow(hwnd_, SW_HIDE);
+        }
     }
 }
 
@@ -241,22 +421,20 @@ size_t ArticleWindow::PickRandomUnseen() {
         for (size_t i = 0; i < articles_.size(); ++i) candidates[i] = i;
     }
 
+    static std::mt19937 gen(
+        static_cast<unsigned>(std::time(nullptr)) ^
+        static_cast<unsigned>(GetTickCount()));
     std::uniform_int_distribution<size_t> dist(0, candidates.size() - 1);
-    return candidates[dist(Rng())];
+    return candidates[dist(gen)];
 }
 
-void ArticleWindow::AdvanceRandom() {
-    if (articles_.size() <= 1) return;
-
-    // 避免与当前这篇连续重复（极少情况下全部候选都是当前这篇时放弃）
+size_t ArticleWindow::AdvanceRandom() {
+    if (articles_.size() <= 1) return index_;
     size_t next = index_;
     for (int i = 0; i < 8 && next == index_; ++i) {
         next = PickRandomUnseen();
     }
-    if (next == index_) return;
-
-    index_ = next;
-    history::MarkSeen(history::Kind::Article, articles_[index_]);
+    return next;
 }
 
 // ---------------------------------------------------------------------------
@@ -268,13 +446,12 @@ int ArticleWindow::S(int value) const {
 
 void ArticleWindow::Reposition() {
     if (!hwnd_) return;
-    if (!cfg_.articleEnabled || articles_.empty()) {
+    if (!cfg_.articleEnabled || !hasArticle_ || articles_.empty()) {
         StopAnimation();
         ShowWindow(hwnd_, SW_HIDE);
         return;
     }
 
-    // 一文跟随倒计时所在显示器（默认右侧同屏）
     dpi_ = static_cast<UINT>(utils::GetWindowDpi(main_ ? main_ : hwnd_));
 
     RECT work{};
@@ -293,8 +470,8 @@ void ArticleWindow::Reposition() {
     int padX = S(kArticlePadX);
     int padY = S(kArticlePadY);
     const std::wstring& text = articles_[index_];
-    const wchar_t* family = cfg_.font.empty()
-        ? L"Segoe UI" : cfg_.font.c_str();
+    const wchar_t* family = cfg_.articleFont.empty()
+        ? L"Segoe UI" : cfg_.articleFont.c_str();
 
     int baseLogical = std::max(8, std::min(96, cfg_.articleFontSize));
     int basePx = S(baseLogical);
@@ -307,7 +484,6 @@ void ArticleWindow::Reposition() {
                            DEFAULT_PITCH | FF_DONTCARE, family);
     };
 
-    // 宽度：固定宽 / 全自适应（按最长行）/ 自定义
     int w;
     if (cfg_.articleSizeMode == ArticleSizeMode::AutoFit) {
         int maxLineW = 0;
@@ -352,7 +528,6 @@ void ArticleWindow::Reposition() {
         return;
     }
 
-    // 从配置字号向下试探，选择能在高度限制内放下的最大字号
     int bestPx = S(8);
     int bestH  = 0;
     if (dc) {
@@ -386,7 +561,6 @@ void ArticleWindow::Reposition() {
         h = std::max(h, S(160));
     }
 
-    // 锚点 + 偏移
     int x, y;
     switch (cfg_.articleAnchor) {
         case WindowAnchor::TopLeft:
@@ -399,7 +573,7 @@ void ArticleWindow::Reposition() {
         case WindowAnchor::BottomCenter:
             x = work.left + (workW - w) / 2 + cfg_.articlePlaceX;
             break;
-        default: // 右侧三个锚点
+        default:
             x = work.right - w + cfg_.articlePlaceX;
             break;
     }
@@ -414,12 +588,11 @@ void ArticleWindow::Reposition() {
         case WindowAnchor::CenterRight:
             y = work.top + (workH - h) / 2 + cfg_.articlePlaceY;
             break;
-        default: // 底部三个锚点
+        default:
             y = work.bottom - h + cfg_.articlePlaceY;
             break;
     }
 
-    // 避免与倒计时窗口重叠：先尝试上下让位，再尝试左右让位
     if (main_) {
         RECT mr{};
         if (GetWindowRect(main_, &mr)) {
@@ -449,7 +622,6 @@ void ArticleWindow::Reposition() {
         }
     }
 
-    // 已显示时做尺寸/位置过渡；首次显示直接落位
     bool animate = IsWindowVisible(hwnd_) != FALSE;
     ApplyTargetRect(x, y, w, h, cfg_.articleIsTop, animate);
 }
@@ -483,7 +655,6 @@ void ArticleWindow::ApplyTargetRect(int x, int y, int w, int h,
     }
 
     if (cur.left == x && cur.top == y && cw == w && ch == h) {
-        // 尺寸未变：仅确保显示与层级
         SetWindowPos(hwnd_, topmost ? HWND_TOPMOST : HWND_NOTOPMOST,
                      0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
@@ -509,13 +680,12 @@ void ArticleWindow::StepAnimation() {
     }
 
     DWORD elapsed = GetTickCount() - animStart_;
-    float t = static_cast<float>(elapsed) / 180.0f; // 180ms 过渡
+    float t = static_cast<float>(elapsed) / 180.0f;
     bool done = false;
     if (t >= 1.0f) {
         t = 1.0f;
         done = true;
     }
-    // ease-out cubic
     float e = 1.0f - (1.0f - t) * (1.0f - t) * (1.0f - t);
     auto lerp = [e](int a, int b) {
         return a + static_cast<int>((b - a) * e);
@@ -598,7 +768,17 @@ bool ArticleWindow::EnsureDib(int w, int h) {
     return true;
 }
 
+void ArticleWindow::DestroyTextFont() {
+    if (textFont_) {
+        DeleteObject(textFont_);
+        textFont_ = nullptr;
+    }
+    textFontPx_ = 0;
+    textFontFamily_.clear();
+}
+
 void ArticleWindow::ReleaseDib() {
+    DestroyTextFont();
     if (mem_dc_) {
         if (dib_) {
             SelectObject(mem_dc_, old_dib_);
@@ -615,7 +795,7 @@ void ArticleWindow::ReleaseDib() {
 }
 
 void ArticleWindow::Render() {
-    if (!hwnd_ || !cfg_.articleEnabled || articles_.empty()) return;
+    if (!hwnd_ || !cfg_.articleEnabled || !hasArticle_ || articles_.empty()) return;
 
     RECT wr{};
     GetWindowRect(hwnd_, &wr);
@@ -627,8 +807,8 @@ void ArticleWindow::Render() {
     HDC mem = mem_dc_;
     BYTE* base = static_cast<BYTE*>(dib_bits_);
 
-    // 背景渐变（与主窗口共用配置的背景色，保持整体风格统一）
-    COLORREF bg = cfg_.backgroundColor;
+    // 一文独立背景色
+    COLORREF bg = cfg_.articleBackgroundColor;
     COLORREF bgTop = utils::BlendColor(bg, RGB(255, 255, 255), 0.10f);
     COLORREF bgBottom = utils::BlendColor(bg, RGB(0, 0, 0), 0.14f);
     TRIVERTEX verts[2] = {};
@@ -645,7 +825,6 @@ void ArticleWindow::Render() {
     GRADIENT_RECT gr = {0, 1};
     GradientFill(mem, verts, 2, &gr, 1, GRADIENT_FILL_RECT_V);
 
-    // 圆角描边（只画边框，保留渐变）；深色背景提亮、浅色背景压暗
     int r = S(18);
     int bgLum = (GetRValue(bg) * 299 + GetGValue(bg) * 587 +
                  GetBValue(bg) * 114) / 1000;
@@ -660,28 +839,31 @@ void ArticleWindow::Render() {
     SelectObject(mem, oldBr);
     DeleteObject(pen);
 
-    // 正文
-    const wchar_t* family = cfg_.font.empty()
-        ? L"Segoe UI" : cfg_.font.c_str();
+    const wchar_t* family = cfg_.articleFont.empty()
+        ? L"Segoe UI" : cfg_.articleFont.c_str();
     int fontPx = layoutFontPx_ > 0 ? layoutFontPx_ : S(14);
-    HFONT f = CreateFontW(-fontPx, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                          DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                          CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                          DEFAULT_PITCH | FF_DONTCARE, family);
-    if (f) {
-        HFONT old = (HFONT)SelectObject(mem, f);
+    if (!textFont_ || textFontPx_ != fontPx ||
+        lstrcmpiW(textFontFamily_.c_str(), family) != 0) {
+        DestroyTextFont();
+        textFont_ = CreateFontW(-fontPx, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                                CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                                DEFAULT_PITCH | FF_DONTCARE, family);
+        textFontPx_ = fontPx;
+        textFontFamily_ = family;
+    }
+    if (textFont_) {
+        HFONT old = (HFONT)SelectObject(mem, textFont_);
         SetBkMode(mem, TRANSPARENT);
-        SetTextColor(mem, cfg_.textColor);
+        SetTextColor(mem, cfg_.articleTextColor);
         RECT rc = {S(kArticlePadX), S(kArticlePadY),
                    w - S(kArticlePadX), h - S(kArticlePadY)};
         DrawTextW(mem, articles_[index_].c_str(), -1, &rc,
                   DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX
                   | DT_EXPANDTABS | DT_EDITCONTROL);
         SelectObject(mem, old);
-        DeleteObject(f);
     }
 
-    // GDI 绘制会清掉 alpha，统一恢复为不透明
     DWORD* px = reinterpret_cast<DWORD*>(base);
     for (int i = 0, n = w * h; i < n; ++i) px[i] |= 0xFF000000u;
 
@@ -690,7 +872,7 @@ void ArticleWindow::Render() {
     POINT zero{0, 0};
     BLENDFUNCTION bf{};
     bf.BlendOp = AC_SRC_OVER;
-    bf.SourceConstantAlpha = 228; // 约 89% 不透明度
+    bf.SourceConstantAlpha = 228;
     bf.AlphaFormat = AC_SRC_ALPHA;
     UpdateLayeredWindow(hwnd_, nullptr, &pt, &sz, mem, &zero, 0, &bf, ULW_ALPHA);
 }

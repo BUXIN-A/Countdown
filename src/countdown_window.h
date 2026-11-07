@@ -7,7 +7,9 @@
 #pragma once
 #include <windows.h>
 #include <string>
+#include <ctime>
 #include "config.h"
+#include "schedule.h"
 #include "tray.h"
 #include "hitokoto.h"
 #include "article_window.h"
@@ -72,8 +74,18 @@ private:
     // 通过独立文本层合成，仅文本渐隐渐显，背景保持不透明
     void DrawHitokoto(HDC mem, int w, int h, BYTE* base, int stride, int fade);
 
-    // 计算当前剩余秒数
-    long long ComputeRemainingSeconds() const;
+    // 计算当前剩余秒数（缓存生效目标时间，目标到达时才重新顺延）
+    long long ComputeRemainingSeconds();
+    void RefreshTargetCache();
+
+    // 计划表：启动/配置变更时重建，每个 Tick 核对是否到期
+    void RebuildSchedules(unsigned long long now);
+    void OnScheduleTick(unsigned long long now);
+
+    // 一言渐隐动画复用的文本层（文本/字号不变时不再逐帧创建 DIB）
+    bool EnsureHitokotoLayer(int w, int h, const std::wstring& text, HFONT font);
+    void ReleaseHitokotoLayer();
+
     // 重绘（使无效）
     void RequestRedraw();
 
@@ -107,7 +119,26 @@ private:
     // 一言自适应字号字体缓存（布局稳定时复用，避免每帧 CreateFontW）
     HFONT fHk_      = nullptr;
     int   fHkSize_  = 0;
+    int   fHkBoxW_  = 0;
+    int   fHkBoxH_  = 0;
     std::wstring lastHkText_; // 与该字体匹配的文本，用于判断缓存是否仍适用
+
+    // 一言动画文本层缓存
+    HDC      hkLayerDc_   = nullptr;
+    HBITMAP  hkLayerBmp_  = nullptr;
+    HGDIOBJ  hkLayerOld_  = nullptr;
+    void*    hkLayerBits_ = nullptr;
+    int      hkLayerW_    = 0;
+    int      hkLayerH_    = 0;
+    std::wstring hkLayerText_;
+    HFONT    hkLayerFont_ = nullptr;
+
+    // 生效目标时间缓存
+    std::time_t targetCacheEpoch_ = 0;
+    std::tm     targetCacheTm_{};
+    bool        targetCacheValid_ = false;
+
+    schedule::Scheduler scheduler_;
 
     // 倒计时内容缓存：同一秒内多次重绘（如一言动画 30ms/帧）不再重复计算
     long long lastRemSec_ = 0;

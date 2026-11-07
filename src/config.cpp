@@ -1,5 +1,7 @@
 // =============================================================================
-// config.cpp - 配置读写实现
+// config.cpp - 分组配置读写实现（schemaVersion = 2）
+//
+// 旧版扁平配置不做迁移：版本号不符时直接写入默认配置并覆盖旧文件。
 // =============================================================================
 #include "config.h"
 #include "hitokoto_category.h"
@@ -9,66 +11,46 @@
 #include <fstream>
 #include <sstream>
 #include <ctime>
+#include <algorithm>
+#include <utility>
 
-// config.json 字段名
-static const char* kTitle    = "title";
-static const char* kTarget   = "targetTime";
-static const char* kFormat   = "displayFormat";
-static const char* kFontSize = "fontSize";
-static const char* kFont     = "font";
-static const char* kBackgroundColor = "backgroundColor";
-static const char* kTextColor = "textColor";
-static const char* kIncludeStart = "includeStartDay";
-static const char* kCycle    = "cycle";
-static const char* kHkSource = "hitokotoSource";
-static const char* kHkCategory = "hitokotoCategory";
-static const char* kHkRefresh = "hitokotoRefreshSec";
-static const char* kArticleEnabled = "articleEnabled";
-static const char* kArticleAnchor  = "articleAnchor";
-static const char* kArticleX       = "articlePlaceX";
-static const char* kArticleY       = "articlePlaceY";
-static const char* kArticleRefresh = "articleRefreshSec";
-static const char* kArticleTop     = "articleIsTop";
-static const char* kArticleFont    = "articleFontSize";
-static const char* kArticleSizeMode = "articleSizeMode";
-static const char* kArticleWidth   = "articleWidth";
-static const char* kArticleHeight  = "articleHeight";
-static const char* kIsTop    = "isTop";
-static const char* kAnchor   = "anchor";
-static const char* kPlaceX   = "place_x";
-static const char* kPlaceY   = "place_y";
-static const char* kAutoStart = "autoStart";
+namespace {
 
-// 锚点 <-> 字符串
-static const char* AnchorToStr(WindowAnchor a) {
+const int kSchemaVersion = 2;
+
+using J = mini_json::Value;
+
+// ---------------------------------------------------------------------------
+// 枚举 <-> 字符串
+// ---------------------------------------------------------------------------
+const char* AnchorToStr(WindowAnchor a) {
     switch (a) {
-        case WindowAnchor::TopLeft:     return "top-left";
-        case WindowAnchor::TopCenter:   return "top-center";
-        case WindowAnchor::TopRight:    return "top-right";
-        case WindowAnchor::CenterLeft:  return "center-left";
-        case WindowAnchor::Center:      return "center";
-        case WindowAnchor::CenterRight: return "center-right";
-        case WindowAnchor::BottomLeft:  return "bottom-left";
+        case WindowAnchor::TopLeft:      return "top-left";
+        case WindowAnchor::TopCenter:    return "top-center";
+        case WindowAnchor::TopRight:     return "top-right";
+        case WindowAnchor::CenterLeft:   return "center-left";
+        case WindowAnchor::Center:       return "center";
+        case WindowAnchor::CenterRight:  return "center-right";
+        case WindowAnchor::BottomLeft:   return "bottom-left";
         case WindowAnchor::BottomCenter: return "bottom-center";
-        case WindowAnchor::BottomRight: return "bottom-right";
+        case WindowAnchor::BottomRight:  return "bottom-right";
     }
     return "top-center";
 }
 
-static WindowAnchor StrToAnchor(const std::string& s) {
-    if (s == "top-left")     return WindowAnchor::TopLeft;
-    if (s == "top-right")    return WindowAnchor::TopRight;
-    if (s == "center-left")  return WindowAnchor::CenterLeft;
-    if (s == "center")       return WindowAnchor::Center;
-    if (s == "center-right") return WindowAnchor::CenterRight;
-    if (s == "bottom-left")  return WindowAnchor::BottomLeft;
+WindowAnchor StrToAnchor(const std::string& s) {
+    if (s == "top-left")      return WindowAnchor::TopLeft;
+    if (s == "top-right")     return WindowAnchor::TopRight;
+    if (s == "center-left")   return WindowAnchor::CenterLeft;
+    if (s == "center")        return WindowAnchor::Center;
+    if (s == "center-right")  return WindowAnchor::CenterRight;
+    if (s == "bottom-left")   return WindowAnchor::BottomLeft;
     if (s == "bottom-center") return WindowAnchor::BottomCenter;
-    if (s == "bottom-right") return WindowAnchor::BottomRight;
-    return WindowAnchor::TopCenter; // 默认顶部居中（含 top-center）
+    if (s == "bottom-right")  return WindowAnchor::BottomRight;
+    return WindowAnchor::TopCenter;
 }
 
-// 循环单位 <-> 字符串
-static const char* CycleToStr(CycleUnit c) {
+const char* CycleToStr(CycleUnit c) {
     switch (c) {
         case CycleUnit::Year:   return "year";
         case CycleUnit::Month:  return "month";
@@ -80,7 +62,7 @@ static const char* CycleToStr(CycleUnit c) {
     }
 }
 
-static CycleUnit StrToCycle(const std::string& s) {
+CycleUnit StrToCycle(const std::string& s) {
     if (s == "year")   return CycleUnit::Year;
     if (s == "month")  return CycleUnit::Month;
     if (s == "day")    return CycleUnit::Day;
@@ -90,8 +72,7 @@ static CycleUnit StrToCycle(const std::string& s) {
     return CycleUnit::None;
 }
 
-// 一文尺寸模式 <-> 字符串
-static const char* ArticleModeToStr(ArticleSizeMode m) {
+const char* ArticleModeToStr(ArticleSizeMode m) {
     switch (m) {
         case ArticleSizeMode::AutoFit: return "auto-fit";
         case ArticleSizeMode::Custom:  return "custom";
@@ -99,24 +80,74 @@ static const char* ArticleModeToStr(ArticleSizeMode m) {
     }
 }
 
-static ArticleSizeMode StrToArticleMode(const std::string& s) {
+ArticleSizeMode StrToArticleMode(const std::string& s) {
     if (s == "auto-fit") return ArticleSizeMode::AutoFit;
     if (s == "custom")   return ArticleSizeMode::Custom;
     return ArticleSizeMode::FixedWidthAutoHeight;
 }
 
-static std::wstring ConfigPath() {
+const char* TempCleanupToStr(TempCleanupMode m) {
+    return m == TempCleanupMode::Size ? "size" : "count";
+}
+
+TempCleanupMode StrToTempCleanup(const std::string& s) {
+    return s == "size" ? TempCleanupMode::Size : TempCleanupMode::Count;
+}
+
+const char* TempTrimToStr(TempTrimMode m) {
+    return m == TempTrimMode::DropOldest ? "oldest" : "clear";
+}
+
+TempTrimMode StrToTempTrim(const std::string& s) {
+    return s == "oldest" ? TempTrimMode::DropOldest : TempTrimMode::ClearAll;
+}
+
+const char* TempUnitToStr(TempSizeUnit u) {
+    return u == TempSizeUnit::GB ? "GB" : "MB";
+}
+
+TempSizeUnit StrToTempUnit(const std::string& s) {
+    return s == "GB" ? TempSizeUnit::GB : TempSizeUnit::MB;
+}
+
+// ---------------------------------------------------------------------------
+// JSON 辅助
+// ---------------------------------------------------------------------------
+const J* SubObject(const J& root, const char* key) {
+    const J* v = root.find(key);
+    return (v && v->is_object()) ? v : nullptr;
+}
+
+int IntValue(const J& obj, const char* key, int fallback) {
+    const J* v = obj.find(key);
+    return v ? static_cast<int>(v->as_number(static_cast<double>(fallback)))
+             : fallback;
+}
+
+bool BoolValue(const J& obj, const char* key, bool fallback) {
+    const J* v = obj.find(key);
+    return v ? v->as_bool(fallback) : fallback;
+}
+
+void LoadColor(const J& obj, const char* key, COLORREF& out) {
+    const J* v = obj.find(key);
+    if (!v || !v->is_string()) return;
+    COLORREF color = 0;
+    if (utils::ParseHexColor(v->as_string(), color)) out = color;
+}
+
+std::wstring ConfigPath() {
     return utils::GetExeDir() + L"config.json";
 }
 
 // 读取整个文件为 UTF-8 字符串；失败返回空
-static bool ReadAll(const std::wstring& path, std::string& out) {
+bool ReadAll(const std::wstring& path, std::string& out) {
     std::ifstream ifs(path.c_str(), std::ios::binary);
     if (!ifs) return false;
     std::ostringstream oss;
     oss << ifs.rdbuf();
     out = oss.str();
-    // 容错 UTF-8 BOM（记事本等编辑器可能写入），否则 JSON 解析会失败
+    // 容错 UTF-8 BOM
     if (out.size() >= 3 &&
         static_cast<unsigned char>(out[0]) == 0xEF &&
         static_cast<unsigned char>(out[1]) == 0xBB &&
@@ -126,9 +157,8 @@ static bool ReadAll(const std::wstring& path, std::string& out) {
     return true;
 }
 
-// 写入文件：先写临时文件再原子替换，避免中途崩溃/断电导致 config.json
-// 损坏为半截内容（旧版本先 trunc 后写，一旦中断配置即丢失）
-static bool WriteAll(const std::wstring& path, const std::string& content) {
+// 先写临时文件再原子替换，避免中途中断写坏配置
+bool WriteAll(const std::wstring& path, const std::string& content) {
     std::wstring tmp = path + L".tmp";
     {
         std::ofstream ofs(tmp.c_str(), std::ios::binary | std::ios::trunc);
@@ -140,11 +170,27 @@ static bool WriteAll(const std::wstring& path, const std::string& content) {
             DeleteFileW(tmp.c_str());
             return false;
         }
-    } // ofs 在此析构关闭文件
-    // 原子替换原文件（MOVEFILE_REPLACE_EXISTING 覆盖，WRITE_THROUGH 刷盘）
+    }
     return MoveFileExW(tmp.c_str(), path.c_str(),
                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
 }
+
+// ---------------------------------------------------------------------------
+// 循环顺延辅助
+// ---------------------------------------------------------------------------
+std::time_t TmToTime(const std::tm& t) {
+    std::tm v = t;
+    v.tm_isdst = -1;
+    return std::mktime(&v);
+}
+
+std::tm TimeToTm(std::time_t t) {
+    std::tm v{};
+    localtime_s(&v, &t);
+    return v;
+}
+
+} // namespace
 
 // ---------------------------------------------------------------------------
 Config Config::Defaults() {
@@ -152,9 +198,6 @@ Config Config::Defaults() {
     c.title = L"\u5012\u8ba1\u65f6"; // "倒计时"
     c.displayFormat = utils::DisplayFormat::HMS;
     c.fontSize = 36;
-    c.font = utils::GetSystemDefaultFontName();
-    // 默认按年循环：目标日固定在 2000-06-07，作为周年纪念日倒计时，
-    // 否则默认目标早已过去，首次启动会一直显示“已结束”
     c.cycle = CycleUnit::Year;
 
     // 默认目标时间：2000-06-07 00:00:00
@@ -167,6 +210,17 @@ Config Config::Defaults() {
     target.tm_sec  = 0;
     target.tm_isdst = 0;
     c.targetTime = target;
+
+    std::wstring defFont = utils::GetSystemDefaultFontName();
+    c.font = defFont;
+    c.hitokotoFont = defFont;
+    c.articleFont = defFont;
+    c.backgroundColor = RGB(20, 20, 30);
+    c.textColor = RGB(235, 235, 245);
+    c.articleBackgroundColor = RGB(20, 20, 30);
+    c.articleTextColor = RGB(235, 235, 245);
+
+    c.articleModule = L"normal";
     return c;
 }
 
@@ -174,196 +228,267 @@ Config Config::Defaults() {
 Config Config::Load() {
     std::string text;
     if (!ReadAll(ConfigPath(), text)) {
-        // 文件不存在：写入默认配置
         Config def = Defaults();
         def.Save();
         return def;
     }
 
-    Config c = Defaults(); // 以默认值兜底
-
+    Config def = Defaults();
     try {
-        mini_json::Value root = mini_json::Value::parse(text);
-        if (!root.is_object()) return c;
+        J root = J::parse(text);
+        if (!root.is_object()) {
+            def.Save();
+            return def;
+        }
+        const J* version = root.find("schemaVersion");
+        if (!version ||
+            static_cast<int>(version->as_number(-1)) != kSchemaVersion) {
+            // 旧版扁平配置 / 未知版本：按用户选择重置为默认
+            def.Save();
+            return def;
+        }
 
-        if (auto* v = root.find(kTitle)) {
-            c.title = utils::Utf8ToWide(v->as_string());
-        }
-        if (auto* v = root.find(kTarget)) {
-            std::tm t{};
-            if (utils::ParseTargetTime(utils::Utf8ToWide(v->as_string()), t)) {
-                c.targetTime = t;
+        Config c = def;
+
+        if (const J* basic = SubObject(root, "basic")) {
+            if (const J* v = basic->find("title")) {
+                c.title = utils::Utf8ToWide(v->as_string());
+            }
+            if (const J* v = basic->find("targetTime")) {
+                std::tm t{};
+                if (utils::ParseTargetTime(utils::Utf8ToWide(v->as_string()), t)) {
+                    c.targetTime = t;
+                }
+            }
+            if (const J* v = basic->find("cycle")) {
+                c.cycle = StrToCycle(v->as_string());
+            }
+            c.includeStartDay = BoolValue(*basic, "includeStartDay", c.includeStartDay);
+            c.autoStart = BoolValue(*basic, "autoStart", c.autoStart);
+
+            if (const J* win = SubObject(*basic, "window")) {
+                if (const J* v = win->find("anchor")) {
+                    c.anchor = StrToAnchor(v->as_string());
+                }
+                int x = IntValue(*win, "offsetX", c.placeX);
+                int y = IntValue(*win, "offsetY", c.placeY);
+                if (x >= -10000 && x <= 10000) c.placeX = x;
+                if (y >= -10000 && y <= 10000) c.placeY = y;
+                c.isTop = BoolValue(*win, "topMost", c.isTop);
+            }
+
+            if (const J* temp = SubObject(*basic, "temp")) {
+                if (const J* v = temp->find("cleanupMode")) {
+                    c.tempCleanupMode = StrToTempCleanup(v->as_string());
+                }
+                if (const J* v = temp->find("sizeUnit")) {
+                    c.tempSizeUnit = StrToTempUnit(v->as_string());
+                }
+                if (const J* v = temp->find("trimMode")) {
+                    c.tempTrimMode = StrToTempTrim(v->as_string());
+                }
+                c.tempArticleLimit = std::max(1, std::min(10000000,
+                    IntValue(*temp, "articleLimit", c.tempArticleLimit)));
+                c.tempHitokotoLimit = std::max(1, std::min(10000000,
+                    IntValue(*temp, "hitokotoLimit", c.tempHitokotoLimit)));
+                c.tempTrimCount = std::max(1, std::min(100000,
+                    IntValue(*temp, "trimCount", c.tempTrimCount)));
             }
         }
-        if (auto* v = root.find(kFormat)) {
-            std::string f = v->as_string();
-            if (f == "YYYY-MM-DD HH:MM:SS") {
-                c.displayFormat = utils::DisplayFormat::Full;
-            } else if (f == "DDDD HH:MM:SS") {
-                c.displayFormat = utils::DisplayFormat::Days;
-            } else {
-                c.displayFormat = utils::DisplayFormat::HMS;
+
+        if (const J* cd = SubObject(root, "countdown")) {
+            if (const J* v = cd->find("displayFormat")) {
+                std::string f = v->as_string();
+                if (f == "YYYY-MM-DD HH:MM:SS") {
+                    c.displayFormat = utils::DisplayFormat::Full;
+                } else if (f == "DDDD HH:MM:SS") {
+                    c.displayFormat = utils::DisplayFormat::Days;
+                } else {
+                    c.displayFormat = utils::DisplayFormat::HMS;
+                }
             }
-        }
-        if (auto* v = root.find(kFontSize)) {
-            int fs = static_cast<int>(v->as_number(-1));
+            int fs = IntValue(*cd, "fontSize", c.fontSize);
             if (fs >= 8 && fs <= 200) c.fontSize = fs;
-        }
-        if (auto* v = root.find(kFont)) {
-            std::wstring f = utils::Utf8ToWide(v->as_string());
-            if (!f.empty()) c.font = f;
-        }
-        if (auto* v = root.find(kBackgroundColor)) {
-            COLORREF color = 0;
-            if (utils::ParseHexColor(v->as_string(), color)) {
-                c.backgroundColor = color;
+            if (const J* v = cd->find("font")) {
+                std::wstring f = utils::Utf8ToWide(v->as_string());
+                if (!f.empty()) c.font = f;
             }
+            LoadColor(*cd, "backgroundColor", c.backgroundColor);
+            LoadColor(*cd, "textColor", c.textColor);
         }
-        if (auto* v = root.find(kTextColor)) {
-            COLORREF color = 0;
-            if (utils::ParseHexColor(v->as_string(), color)) {
-                c.textColor = color;
+
+        if (const J* hk = SubObject(root, "hitokoto")) {
+            if (const J* v = hk->find("source")) {
+                std::string s = v->as_string();
+                if (s == "local")        c.hitokotoSource = HitokotoSource::Local;
+                else if (s == "network") c.hitokotoSource = HitokotoSource::Network;
+                else if (s == "both")    c.hitokotoSource = HitokotoSource::Both;
             }
-        }
-        if (auto* v = root.find(kIncludeStart)) {
-            c.includeStartDay = v->as_bool();
-        }
-        if (auto* v = root.find(kCycle)) {
-            c.cycle = StrToCycle(v->as_string());
-        }
-        if (auto* v = root.find(kHkSource)) {
-            std::string s = v->as_string();
-            if (s == "local")      c.hitokotoSource = HitokotoSource::Local;
-            else if (s == "network") c.hitokotoSource = HitokotoSource::Network;
-            else if (s == "both")  c.hitokotoSource = HitokotoSource::Both;
-        }
-        if (auto* v = root.find(kHkRefresh)) {
-            int sec = static_cast<int>(v->as_number(-1));
+            if (const J* v = hk->find("category")) {
+                std::string cat = v->as_string();
+                if (hitokoto_category::IsValidCode(cat)) c.hitokotoCategory = cat;
+            }
+            int sec = IntValue(*hk, "refreshSec", c.hitokotoRefreshSec);
             if (sec >= 5 && sec <= 3600) c.hitokotoRefreshSec = sec;
+            if (const J* v = hk->find("font")) {
+                std::wstring f = utils::Utf8ToWide(v->as_string());
+                if (!f.empty()) c.hitokotoFont = f;
+            }
+            c.hitokotoBold = BoolValue(*hk, "bold", c.hitokotoBold);
         }
-        if (auto* v = root.find(kHkCategory)) {
-            std::string cat = v->as_string();
-            if (hitokoto_category::IsValidCode(cat)) c.hitokotoCategory = cat;
-        }
-        if (auto* v = root.find(kArticleEnabled)) {
-            c.articleEnabled = v->as_bool();
-        }
-        if (auto* v = root.find(kArticleAnchor)) {
-            c.articleAnchor = StrToAnchor(v->as_string());
-        }
-        if (auto* v = root.find(kArticleX)) {
-            int px = static_cast<int>(v->as_number(0));
-            if (px >= -10000 && px <= 10000) c.articlePlaceX = px;
-        }
-        if (auto* v = root.find(kArticleY)) {
-            int py = static_cast<int>(v->as_number(0));
-            if (py >= -10000 && py <= 10000) c.articlePlaceY = py;
-        }
-        if (auto* v = root.find(kArticleRefresh)) {
-            int sec = static_cast<int>(v->as_number(-1));
+
+        if (const J* art = SubObject(root, "article")) {
+            c.articleEnabled = BoolValue(*art, "enabled", c.articleEnabled);
+            int sec = IntValue(*art, "refreshSec", c.articleRefreshSec);
             if (sec >= 1 && sec <= 86399) c.articleRefreshSec = sec;
-        }
-        if (auto* v = root.find(kArticleTop)) {
-            c.articleIsTop = v->as_bool();
-        }
-        if (auto* v = root.find(kArticleFont)) {
-            int fs = static_cast<int>(v->as_number(-1));
+            int fs = IntValue(*art, "fontSize", c.articleFontSize);
             if (fs >= 8 && fs <= 96) c.articleFontSize = fs;
+            if (const J* v = art->find("font")) {
+                std::wstring f = utils::Utf8ToWide(v->as_string());
+                if (!f.empty()) c.articleFont = f;
+            }
+            LoadColor(*art, "backgroundColor", c.articleBackgroundColor);
+            LoadColor(*art, "textColor", c.articleTextColor);
+            if (const J* v = art->find("module")) {
+                std::wstring id = utils::Utf8ToWide(v->as_string());
+                if (!id.empty()) c.articleModule = id;
+            }
+
+            if (const J* layout = SubObject(*art, "layout")) {
+                if (const J* v = layout->find("anchor")) {
+                    c.articleAnchor = StrToAnchor(v->as_string());
+                }
+                int x = IntValue(*layout, "offsetX", c.articlePlaceX);
+                int y = IntValue(*layout, "offsetY", c.articlePlaceY);
+                if (x >= -10000 && x <= 10000) c.articlePlaceX = x;
+                if (y >= -10000 && y <= 10000) c.articlePlaceY = y;
+                if (const J* v = layout->find("sizeMode")) {
+                    c.articleSizeMode = StrToArticleMode(v->as_string());
+                }
+                int w = IntValue(*layout, "width", c.articleWidth);
+                int h = IntValue(*layout, "height", c.articleHeight);
+                if (w >= 180 && w <= 1200) c.articleWidth = w;
+                if (h >= 120 && h <= 2000) c.articleHeight = h;
+                c.articleIsTop = BoolValue(*layout, "topMost", c.articleIsTop);
+            }
+
+            if (const J* mods = SubObject(*art, "modules")) {
+                for (const auto& kv : mods->as_object()) {
+                    if (kv.second.is_object()) {
+                        c.articleModuleConfigs[kv.first] =
+                            J::serialize(kv.second, false);
+                    }
+                }
+            }
         }
-        if (auto* v = root.find(kArticleSizeMode)) {
-            c.articleSizeMode = StrToArticleMode(v->as_string());
-        }
-        if (auto* v = root.find(kArticleWidth)) {
-            int w = static_cast<int>(v->as_number(-1));
-            if (w >= 180 && w <= 1200) c.articleWidth = w;
-        }
-        if (auto* v = root.find(kArticleHeight)) {
-            int h = static_cast<int>(v->as_number(-1));
-            if (h >= 120 && h <= 2000) c.articleHeight = h;
-        }
-        if (auto* v = root.find(kIsTop)) {
-            c.isTop = v->as_bool();
-        }
-        if (auto* v = root.find(kAnchor)) {
-            c.anchor = StrToAnchor(v->as_string());
-        }
-        if (auto* v = root.find(kPlaceX)) {
-            int px = static_cast<int>(v->as_number(0));
-            if (px >= -10000 && px <= 10000) c.placeX = px;
-        }
-        if (auto* v = root.find(kPlaceY)) {
-            int py = static_cast<int>(v->as_number(0));
-            if (py >= -10000 && py <= 10000) c.placeY = py;
-        }
-        if (auto* v = root.find(kAutoStart)) {
-            c.autoStart = v->as_bool();
-        }
+
+        if (c.title.empty()) c.title = def.title;
+        return c;
     } catch (...) {
-        // 解析失败，返回默认配置
+        def.Save();
+        return def;
     }
-    return c;
 }
 
 // ---------------------------------------------------------------------------
 bool Config::Save() const {
-    using J = mini_json::Value;
-    mini_json::Object obj;
+    mini_json::Object root;
+    root.emplace_back("schemaVersion", J(kSchemaVersion));
 
-    obj.emplace_back(kTitle,    J(utils::WideToUtf8(title)));
-    obj.emplace_back(kTarget,   J(utils::WideToUtf8(utils::FormatTargetTime(targetTime))));
-    obj.emplace_back(kFormat,
-        J(displayFormat == utils::DisplayFormat::Full
-              ? "YYYY-MM-DD HH:MM:SS"
-              : displayFormat == utils::DisplayFormat::Days
-                    ? "DDDD HH:MM:SS" : "HH:MM:SS"));
-    obj.emplace_back(kFontSize, J(fontSize));
-    obj.emplace_back(kFont,     J(utils::WideToUtf8(font)));
-    obj.emplace_back(kBackgroundColor, J(utils::ColorToHex(backgroundColor)));
-    obj.emplace_back(kTextColor,       J(utils::ColorToHex(textColor)));
-    obj.emplace_back(kIncludeStart, J(includeStartDay));
-    obj.emplace_back(kCycle,    J(CycleToStr(cycle)));
+    {
+        mini_json::Object basic;
+        basic.emplace_back("title", J(utils::WideToUtf8(title)));
+        basic.emplace_back("targetTime",
+            J(utils::WideToUtf8(utils::FormatTargetTime(targetTime))));
+        basic.emplace_back("cycle", J(CycleToStr(cycle)));
+        basic.emplace_back("includeStartDay", J(includeStartDay));
+        basic.emplace_back("autoStart", J(autoStart));
 
-    const char* src =
-        hitokotoSource == HitokotoSource::Local  ? "local" :
-        hitokotoSource == HitokotoSource::Network ? "network" : "both";
-    obj.emplace_back(kHkSource,  J(src));
-    obj.emplace_back(kHkCategory, J(hitokotoCategory));
-    obj.emplace_back(kHkRefresh, J(hitokotoRefreshSec));
-    obj.emplace_back(kArticleEnabled, J(articleEnabled));
-    obj.emplace_back(kArticleAnchor,  J(AnchorToStr(articleAnchor)));
-    obj.emplace_back(kArticleX,       J(articlePlaceX));
-    obj.emplace_back(kArticleY,       J(articlePlaceY));
-    obj.emplace_back(kArticleRefresh, J(articleRefreshSec));
-    obj.emplace_back(kArticleTop,     J(articleIsTop));
-    obj.emplace_back(kArticleFont,    J(articleFontSize));
-    obj.emplace_back(kArticleSizeMode, J(ArticleModeToStr(articleSizeMode)));
-    obj.emplace_back(kArticleWidth,   J(articleWidth));
-    obj.emplace_back(kArticleHeight,  J(articleHeight));
-    obj.emplace_back(kIsTop,    J(isTop));
-    obj.emplace_back(kAnchor,   J(AnchorToStr(anchor)));
-    obj.emplace_back(kPlaceX,   J(placeX));
-    obj.emplace_back(kPlaceY,   J(placeY));
-    obj.emplace_back(kAutoStart, J(autoStart));
+        mini_json::Object win;
+        win.emplace_back("anchor", J(AnchorToStr(anchor)));
+        win.emplace_back("offsetX", J(placeX));
+        win.emplace_back("offsetY", J(placeY));
+        win.emplace_back("topMost", J(isTop));
+        basic.emplace_back("window", J(std::move(win)));
 
-    std::string json = mini_json::Value::serialize(J(std::move(obj)), /*pretty=*/true);
+        mini_json::Object temp;
+        temp.emplace_back("cleanupMode", J(TempCleanupToStr(tempCleanupMode)));
+        temp.emplace_back("sizeUnit", J(TempUnitToStr(tempSizeUnit)));
+        temp.emplace_back("articleLimit", J(tempArticleLimit));
+        temp.emplace_back("hitokotoLimit", J(tempHitokotoLimit));
+        temp.emplace_back("trimMode", J(TempTrimToStr(tempTrimMode)));
+        temp.emplace_back("trimCount", J(tempTrimCount));
+        basic.emplace_back("temp", J(std::move(temp)));
+
+        root.emplace_back("basic", J(std::move(basic)));
+    }
+
+    {
+        mini_json::Object cd;
+        cd.emplace_back("displayFormat",
+            J(displayFormat == utils::DisplayFormat::Full
+                  ? "YYYY-MM-DD HH:MM:SS"
+                  : displayFormat == utils::DisplayFormat::Days
+                        ? "DDDD HH:MM:SS" : "HH:MM:SS"));
+        cd.emplace_back("font", J(utils::WideToUtf8(font)));
+        cd.emplace_back("fontSize", J(fontSize));
+        cd.emplace_back("backgroundColor", J(utils::ColorToHex(backgroundColor)));
+        cd.emplace_back("textColor", J(utils::ColorToHex(textColor)));
+        root.emplace_back("countdown", J(std::move(cd)));
+    }
+
+    {
+        const char* src =
+            hitokotoSource == HitokotoSource::Local  ? "local" :
+            hitokotoSource == HitokotoSource::Network ? "network" : "both";
+        mini_json::Object hk;
+        hk.emplace_back("source", J(src));
+        hk.emplace_back("category", J(hitokotoCategory));
+        hk.emplace_back("refreshSec", J(hitokotoRefreshSec));
+        hk.emplace_back("font", J(utils::WideToUtf8(hitokotoFont)));
+        hk.emplace_back("bold", J(hitokotoBold));
+        root.emplace_back("hitokoto", J(std::move(hk)));
+    }
+
+    {
+        mini_json::Object art;
+        art.emplace_back("enabled", J(articleEnabled));
+        art.emplace_back("refreshSec", J(articleRefreshSec));
+        art.emplace_back("fontSize", J(articleFontSize));
+        art.emplace_back("font", J(utils::WideToUtf8(articleFont)));
+        art.emplace_back("backgroundColor", J(utils::ColorToHex(articleBackgroundColor)));
+        art.emplace_back("textColor", J(utils::ColorToHex(articleTextColor)));
+        art.emplace_back("module", J(utils::WideToUtf8(articleModule)));
+
+        mini_json::Object layout;
+        layout.emplace_back("anchor", J(AnchorToStr(articleAnchor)));
+        layout.emplace_back("offsetX", J(articlePlaceX));
+        layout.emplace_back("offsetY", J(articlePlaceY));
+        layout.emplace_back("sizeMode", J(ArticleModeToStr(articleSizeMode)));
+        layout.emplace_back("width", J(articleWidth));
+        layout.emplace_back("height", J(articleHeight));
+        layout.emplace_back("topMost", J(articleIsTop));
+        art.emplace_back("layout", J(std::move(layout)));
+
+        mini_json::Object modules;
+        for (const auto& kv : articleModuleConfigs) {
+            try {
+                J value = J::parse(kv.second);
+                if (value.is_object()) modules.emplace_back(kv.first, std::move(value));
+            } catch (...) {
+                // 非法模块配置不写入，避免污染配置文件
+            }
+        }
+        art.emplace_back("modules", J(std::move(modules)));
+
+        root.emplace_back("article", J(std::move(art)));
+    }
+
+    std::string json = J::serialize(J(std::move(root)), /*pretty=*/true);
     return WriteAll(ConfigPath(), json);
 }
 
 // ---------------------------------------------------------------------------
-// 循环顺延：把已过去的目标时间按单位推进到未来
-// ---------------------------------------------------------------------------
-static std::time_t TmToTime(const std::tm& t) {
-    std::tm v = t;
-    v.tm_isdst = -1;
-    return std::mktime(&v);
-}
-
-static std::tm TimeToTm(std::time_t t) {
-    std::tm v{};
-    localtime_s(&v, &t);
-    return v;
-}
-
 std::tm Config::EffectiveTargetTime() const {
     std::time_t now = std::time(nullptr);
     std::time_t target = TmToTime(targetTime);
@@ -373,7 +498,6 @@ std::tm Config::EffectiveTargetTime() const {
         case CycleUnit::Second:
         case CycleUnit::Minute:
         case CycleUnit::Hour: {
-            // 固定时长单位：直接按整数倍跳到 now 之后
             long long step = cycle == CycleUnit::Second ? 1
                            : cycle == CycleUnit::Minute ? 60 : 3600;
             long long diff = static_cast<long long>(now)
@@ -384,14 +508,13 @@ std::tm Config::EffectiveTargetTime() const {
             return TimeToTm(next);
         }
         case CycleUnit::Day: {
-            // 按日历日推进，保持本地钟点；先估算再校正 DST 偏差
             std::tm t = targetTime;
             t.tm_isdst = -1;
             long long diff = static_cast<long long>(now)
                            - static_cast<long long>(target);
             long long days = diff / 86400 + 1;
             if (days < 1) days = 1;
-            if (days > 100000) days = 100000; // 防御异常目标时间
+            if (days > 100000) days = 100000;
             t.tm_mday += static_cast<int>(days);
             std::time_t next = std::mktime(&t);
             for (int i = 0; next != (std::time_t)-1 && next <= now && i < 2; ++i) {
@@ -403,11 +526,9 @@ std::tm Config::EffectiveTargetTime() const {
         }
         case CycleUnit::Month:
         case CycleUnit::Year: {
-            // 按日历月/年推进（mktime 自动处理跨年、月末与闰年）
             std::tm t = targetTime;
             t.tm_isdst = -1;
             std::time_t next = std::mktime(&t);
-            // 上限 2400 次（200 年），防止异常配置导致长循环
             for (int i = 0; next != (std::time_t)-1 && next <= now && i < 2400; ++i) {
                 if (cycle == CycleUnit::Year) t.tm_year += 1;
                 else                          t.tm_mon  += 1;
@@ -419,4 +540,42 @@ std::tm Config::EffectiveTargetTime() const {
         default:
             return targetTime;
     }
+}
+
+// ---------------------------------------------------------------------------
+std::string Config::ArticleModuleConfig(const std::wstring& moduleId) const {
+    std::string key = utils::WideToUtf8(moduleId);
+    auto it = articleModuleConfigs.find(key);
+    if (it == articleModuleConfigs.end()) return "{}";
+    return it->second;
+}
+
+void Config::SetArticleModuleConfig(const std::wstring& moduleId,
+                                    const std::string& json) {
+    try {
+        J value = J::parse(json);
+        if (!value.is_object()) return;
+        articleModuleConfigs[utils::WideToUtf8(moduleId)] =
+            J::serialize(value, false);
+    } catch (...) {
+        // 非法 JSON 直接忽略
+    }
+}
+
+// ---------------------------------------------------------------------------
+static long long UnitToBytes(TempSizeUnit unit, int value) {
+    long long v = std::max(1, value);
+    long long multiplier = unit == TempSizeUnit::GB
+                               ? 1024LL * 1024LL * 1024LL
+                               : 1024LL * 1024LL;
+    if (v > 10000000LL) v = 10000000LL;
+    return v * multiplier;
+}
+
+long long Config::TempArticleLimitBytes() const {
+    return UnitToBytes(tempSizeUnit, tempArticleLimit);
+}
+
+long long Config::TempHitokotoLimitBytes() const {
+    return UnitToBytes(tempSizeUnit, tempHitokotoLimit);
 }

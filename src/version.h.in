@@ -1,0 +1,18 @@
+// =============================================================================
+// version.h - 程序版本（由 CMake 从 project() 版本号生成）
+// =============================================================================
+#pragma once
+
+#define APP_VERSION_MAJOR @PROJECT_VERSION_MAJOR@
+#define APP_VERSION_MINOR @PROJECT_VERSION_MINOR@
+#define APP_VERSION_PATCH @PROJECT_VERSION_PATCH@
+#define APP_VERSION_STRING L"@PROJECT_VERSION@"
+#define APP_VERSION_UTF8 "@PROJECT_VERSION@"
+
+// 程序显示名称（关于页/更新提示使用；倒计时标题仍是用户配置项）
+#define APP_NAME    L"\u5012\u8ba1\u65f6"
+#define APP_NAME_EN L"Countdown"
+
+// 获取更新地址
+#define APP_UPDATE_URL L"https://github.com/BUXIN-A/Countdown"
+#define APP_UPDATE_URL_UTF8 "https://github.com/BUXIN-A/Countdown"

@@ -6,6 +6,7 @@
 #include "history.h"
 #include "json.h"
 #include "utils.h"
+#include "version.h"
 
 #include <winhttp.h>
 #include <thread>
@@ -13,6 +14,7 @@
 #include <sstream>
 #include <algorithm>
 #include <cstdlib>
+#include <new>
 #include <random>
 #include <ctime>
 #include <utility>
@@ -21,8 +23,6 @@
 static const float kFadeOutMs = 150.0f;
 static const float kFadeInMs  = 200.0f;
 
-// 网络记录达到该数量后视为“已看过一轮”，清空后重新开始
-static const int kMaxNetworkHistory = 5000;
 // 网络返回已看过的句子时，最多连续重新请求的次数
 static const int kMaxFetchRetries = 6;
 
@@ -40,13 +40,12 @@ void HitokotoManager::Init(HWND hwnd, const Config& cfg) {
     hwnd_ = hwnd;
     cfg_ = cfg;
     LoadLocal();
-    lastFetch_ = GetTickCount();
 }
 
 void HitokotoManager::ApplyConfig(const Config& cfg) {
     cfg_ = cfg;
-    lastFetch_ = GetTickCount();
-    FetchNext(); // 立即按新配置获取一句
+    LoadLocal();  // 本地文件可能在设置期间新增
+    FetchNext();  // 立即按新配置获取一句
 }
 
 // ---------------------------------------------------------------------------
@@ -87,17 +86,10 @@ void HitokotoManager::Animate(DWORD now) {
 }
 
 // ---------------------------------------------------------------------------
-// 每帧：动画推进 + 刷新周期检查
+// 每帧：只推进动画；刷新时刻由主窗口计划表核对
 // ---------------------------------------------------------------------------
-void HitokotoManager::Tick() {
-    DWORD now = GetTickCount();
+void HitokotoManager::Tick(DWORD now) {
     Animate(now);
-
-    if (cfg_.hitokotoRefreshSec > 0 &&
-        now - lastFetch_ >= static_cast<DWORD>(cfg_.hitokotoRefreshSec) * 1000) {
-        lastFetch_ = now;
-        FetchNext();
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -209,7 +201,7 @@ void HitokotoManager::TakeLocal() {
 // ---------------------------------------------------------------------------
 std::wstring HitokotoManager::FetchNetwork(const std::string& category) {
     std::wstring result;
-    HINTERNET hSession = WinHttpOpen(L"Countdown/1.0",
+    HINTERNET hSession = WinHttpOpen(L"Countdown/" APP_VERSION_STRING,
                                      WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                      WINHTTP_NO_PROXY_NAME,
                                      WINHTTP_NO_PROXY_BYPASS, 0);
@@ -279,11 +271,6 @@ void HitokotoManager::StartNetwork() {
     std::string category = cfg_.hitokotoCategory;
 
     std::thread([hwnd, category]() {
-        // 网络记录足够多时视为已看过一轮，清空后重新开始
-        if (history::SeenCount(history::Kind::NetworkHitokoto) >= kMaxNetworkHistory) {
-            history::Clear(history::Kind::NetworkHitokoto);
-        }
-
         std::wstring result;
         bool duplicate = false;
         for (int attempt = 0; attempt < kMaxFetchRetries; ++attempt) {
@@ -302,10 +289,12 @@ void HitokotoManager::StartNetwork() {
             history::MarkSeen(history::Kind::NetworkHitokoto, result);
         }
 
-        std::wstring* payload = new std::wstring(std::move(result));
-        // 窗口可能已在请求期间销毁：PostMessage 失败时手动释放，
-        // 避免堆分配字符串泄漏（成功时由主窗口 WM_APP_HITOKOTO 处理释放）
-        if (!PostMessageW(hwnd, WM_APP_HITOKOTO, 0,
+        std::wstring* payload = new (std::nothrow) std::wstring(std::move(result));
+        if (!payload) return;
+        // 窗口可能已在请求期间销毁：先检查句柄有效，再投递；
+        // 失败时手动释放，避免堆分配字符串泄漏
+        if (!IsWindow(hwnd) ||
+            !PostMessageW(hwnd, WM_APP_HITOKOTO, 0,
                           reinterpret_cast<LPARAM>(payload))) {
             delete payload;
         }

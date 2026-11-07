@@ -1,15 +1,16 @@
 // =============================================================================
 // article_window.h - 一文栏目（屏幕右侧长文卡片）
 //
-// 独立的分层窗口，从 exe 同目录 article\ 文件夹内所有 .txt 加载文章
-// （每个文件视为一篇），按配置的刷新时间随机切换，并通过 temp\article.txt
-// 记录已显示过的文章，尽量不重复；全部看过后清空记录重新开始。
-// 位置使用九宫格锚点 + 偏移，并在与倒计时窗口相交时自动避让。
+// 从 exe 同目录 article\ 文件夹加载文章（每个文件 / /*/ 分隔段落视为一篇）。
+// 显示哪一篇由 lib\article 下的 DLL 模块决定（normal/week ...）；
+// 模块缺失或加载失败时回退到内置随机逻辑。
+// 刷新时刻由主窗口计划表驱动，窗口本身不保存计时器。
 // =============================================================================
 #pragma once
 #include <windows.h>
 #include <string>
 #include <vector>
+#include "article_module_registry.h"
 #include "config.h"
 
 class ArticleWindow {
@@ -17,22 +18,32 @@ public:
     static const wchar_t* ClassName() { return L"CountdownArticleWindow"; }
     static bool RegisterClass(HINSTANCE hInst);
 
-    // 创建（初始隐藏），main 用于避让倒计时窗口
     bool Create(HINSTANCE hInst, HWND main);
-
-    // 销毁窗口与 GDI 资源
     void Destroy();
 
-    // 应用配置：重新加载文章、显示/隐藏、定位并重绘
+    // 应用配置：重新加载文章、模块配置、显示/隐藏、定位并重绘
     void ApplyConfig(const Config& cfg);
 
-    // 主窗口定时器驱动：检查刷新周期
-    void Tick();
+    // 计划表到期：按模块逻辑刷新文章
+    void RefreshNow();
+    // 本地零点：week 模块需要按新星期重新评估
+    void RefreshForDayChange();
 
     // 重新定位（配置/DPI/倒计时位置变化后调用）
     void Reposition();
 
     HWND hwnd() const { return hwnd_; }
+
+    // ---- 一文模块宿主回调（public 供 C 回调函数访问）----
+    int ModuleArticleCount() const;
+    const char* ModuleArticleKey(int index) const;
+    bool ModuleIsSeen(const char* key) const;
+    void ModuleMarkSeen(const char* key);
+    void ModuleClearSeen();
+    const wchar_t* ModuleTempDir() const;
+    void ModuleLocalTime(int* year, int* month, int* day, int* weekday,
+                         int* hour, int* minute, int* second);
+    unsigned int ModuleRandomU32();
 
 private:
     static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
@@ -40,12 +51,17 @@ private:
 
     void LoadArticles();
     void CreateDefaultFile();
-    size_t PickRandomUnseen();   // 随机选一篇未显示过的（全部看过则清空后重选）
-    void AdvanceRandom();        // 随机切换到下一篇（避免与当前重复）
+    size_t PickRandomUnseen();       // 内置回退：随机选未显示过的
+    size_t AdvanceRandom();          // 内置回退：避免与当前重复
+
+    // 用当前模块/内置逻辑选择文章；reason 见 ARTICLE_SELECT_*
+    // 返回索引或可见状态是否发生变化
+    bool SelectArticle(int reason);
+    void MarkCurrentSeen();
+
     void ApplyRoundedRegion();
     void Render();
 
-    // 尺寸/位置切换动画（切换文章或改尺寸时平滑过渡）
     void ApplyTargetRect(int x, int y, int w, int h, bool topmost, bool animate);
     void StepAnimation();
     void StopAnimation();
@@ -69,14 +85,23 @@ private:
     UINT   dpi_ = 96;
 
     std::vector<std::wstring> articles_;
+    std::vector<std::string>  articleKeys_;
     size_t index_ = 0;
-    bool   firstPick_ = true;   // 首次显示时随机选一篇
-    DWORD  lastSwitch_ = 0;
+    bool   hasArticle_ = false; // 当前是否有可显示文章（week 未覆盖日为 false）
 
-    // 由 Reposition 决定、Render 复用的字号
+    // 当前模块
+    ArticleModuleInstance module_;
+    ArticleModuleHostApi  moduleHost_{};
+    std::wstring          moduleId_;
+
     int layoutFontPx_ = 0;
 
-    // 复用的整窗 DIB
+    // 正文渲染字体缓存（动画每帧重绘时避免反复 CreateFontW）
+    HFONT textFont_ = nullptr;
+    int   textFontPx_ = 0;
+    std::wstring textFontFamily_;
+    void DestroyTextFont();
+
     HDC      mem_dc_   = nullptr;
     HBITMAP  dib_      = nullptr;
     HGDIOBJ  old_dib_  = nullptr;

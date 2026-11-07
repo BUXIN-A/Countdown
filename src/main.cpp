@@ -4,9 +4,11 @@
 #include <windows.h>
 #include <commctrl.h>
 
+#include "article_module_registry.h"
 #include "countdown_window.h"
 #include "resource.h"
 #include "utils.h"
+#include "version.h"
 
 // 单实例互斥体名称（会话级：同一登录会话内保证唯一）
 static const wchar_t kSingleInstanceMutex[] = L"Local\\Countdown_SingleInstance_Mutex";
@@ -22,6 +24,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         CloseHandle(hMutex);
         return 0;
     }
+    // 互斥体创建失败（权限/资源异常）不阻塞启动，仅失去单实例保护
     // 注册公共控件类
     INITCOMMONCONTROLSEX icc{};
     icc.dwSize = sizeof(icc);
@@ -32,6 +35,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     // 提前加载 exe\fonts 下的本地字体：配置里若保存了本地字体，
     // 窗口创建时就能用正确的字体渲染（不必等打开设置页）
     utils::LoadLocalFonts();
+
+    // 扫描 lib\article 下的一文显示模块（失败时一文使用内置随机逻辑）
+    ArticleModuleRegistry::Instance().LoadAll();
 
     if (!CountdownWindow::RegisterClass(hInstance)) {
         MessageBoxW(nullptr, L"\u6ce8\u518c\u7a97\u53e3\u7c7b\u5931\u8d25",
@@ -46,11 +52,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         return 2;
     }
 
-    MSG msg;
-    while (GetMessage(&msg, nullptr, 0, 0) > 0) {
+    MSG msg{};
+    int ret = 0;
+    while ((ret = GetMessage(&msg, nullptr, 0, 0)) > 0) {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
-
-    return static_cast<int>(msg.wParam);
+    if (ret == 0) return static_cast<int>(msg.wParam);
+    return 1; // GetMessage 返回 -1：消息循环异常
 }

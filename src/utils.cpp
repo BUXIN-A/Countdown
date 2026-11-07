@@ -393,10 +393,19 @@ bool ReadTextFile(const std::wstring& path, std::wstring& out,
     std::ifstream ifs(path.c_str(), std::ios::binary);
     if (!ifs) return false;
 
+    // 先取实际文件大小再分配，避免为小文件一次性申请 maxBytes（如 64MB）
+    ifs.seekg(0, std::ios::end);
+    std::streamsize fileSize = ifs.tellg();
+    ifs.seekg(0, std::ios::beg);
+    if (fileSize < 0) return false;
+    size_t want = static_cast<size_t>(fileSize);
+    if (want > maxBytes) want = maxBytes;
+
     std::string content;
-    content.resize(maxBytes);
-    std::streamsize got = ifs.read(&content[0],
-        static_cast<std::streamsize>(maxBytes)).gcount();
+    content.resize(want);
+    std::streamsize got = want == 0
+        ? 0
+        : ifs.read(&content[0], static_cast<std::streamsize>(want)).gcount();
     content.resize(static_cast<size_t>(got));
 
     // 容错 UTF-8 BOM

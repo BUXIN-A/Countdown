@@ -16,6 +16,10 @@
 #define WM_APP_HITOKOTO (WM_APP + 4)
 // 关闭月历浮层（从月历通知中返回后再销毁，避免在控件自身通知里销毁控件）
 #define WM_APP_CLOSE_CALENDAR (WM_APP + 6)
+// 一文模块配置对话框：增删时间段后重建布局（延后执行，避免销毁自身按钮）
+#define WM_APP_REBUILD_MODULE (WM_APP + 7)
+// 关闭星期选择浮层（延后执行，避免在列表自身通知里销毁列表）
+#define WM_APP_CLOSE_DAY_POPUP (WM_APP + 8)
 
 // 托盘右键菜单命令
 #define IDM_TRAY_SETTINGS 2001
@@ -75,8 +79,35 @@
 #define IDC_BTN_STEP_MINUS         3047
 #define IDC_BTN_STEP_PLUS          3048
 #define IDC_DROPDOWN_LIST          3049
-// 外观颜色
+// 外观颜色（倒计时）
 #define IDC_BTN_BG_COLOR           3052
 #define IDC_BTN_TEXT_COLOR         3053
+// 一言加粗 / 一文独立外观
+#define IDC_BTN_HK_BOLD            3054
+#define IDC_BTN_ART_BG_COLOR       3055
+#define IDC_BTN_ART_TEXT_COLOR     3056
+// 一文显示模块
+#define IDC_BTN_ARTICLE_MODULE     3057
+#define IDC_BTN_MODULE_CONFIG      3058
+// 临时数据
+#define IDC_BTN_TEMP_CLEAN         3059
+#define IDC_EDIT_TEMP_ART_LIMIT    3060
+#define IDC_EDIT_TEMP_HK_LIMIT     3061
+#define IDC_EDIT_TEMP_TRIM_COUNT   3062
+#define IDC_STATIC_ART_LIMIT_LABEL 3063
+#define IDC_STATIC_HK_LIMIT_LABEL  3064
+#define IDC_STATIC_MODULE_HINT     3065
+// 关于页
+#define IDC_BTN_UPDATE             3066
 // 设置页标签
 #define IDC_TAB_MAIN               3030
+
+// 一文模块配置对话框
+#define IDC_MC_RANGES_ADD          3200
+#define IDC_MC_OK                  3201
+#define IDC_MC_CANCEL              3202
+#define IDC_MC_DAY_POPUP           3203
+#define IDC_MC_RANGE_DELETE_BASE   3220
+#define IDC_MC_RANGE_START_BASE    3240
+#define IDC_MC_RANGE_END_BASE      3260
+#define IDC_MC_DAY_ITEM_BASE       3300

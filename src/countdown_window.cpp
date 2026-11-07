@@ -3,6 +3,7 @@
 // =============================================================================
 #include "countdown_window.h"
 #include "../resource.h"
+#include "history.h"
 #include "utils.h"
 #include "settings_window.h"
 
@@ -85,6 +86,18 @@ LRESULT CountdownWindow::Handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             Reposition();
             article_.Reposition(); // 一文按新 DPI 重新避让
             return 0;
+        case WM_DISPLAYCHANGE:
+            Reposition();
+            article_.Reposition();
+            return 0;
+        case WM_SETTINGCHANGE:
+            // 工作区/任务栏变化后重新贴合屏幕边缘
+            if (wp == SPI_SETWORKAREA) {
+                Reposition();
+                article_.Reposition();
+                return 0;
+            }
+            break;
         case WM_PAINT: {
             // 分层窗口内容由 UpdateLayeredWindow 提供，这里仅验证区域
             PAINTSTRUCT ps;
@@ -121,6 +134,7 @@ LRESULT CountdownWindow::Handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         default:
             return DefWindowProcW(hwnd, msg, wp, lp);
     }
+    return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
 // ---------------------------------------------------------------------------
@@ -138,8 +152,10 @@ void CountdownWindow::OnCreate() {
         g_taskbarCreatedMsg = RegisterWindowMessageW(L"TaskbarCreated");
     }
 
-    // 加载配置
+    // 加载配置，并应用临时数据清理策略（可能在启动时裁剪超限记录）
     config_ = Config::Load();
+    history::ApplyConfig(config_);
+    targetCacheValid_ = false;
     RebuildFonts();
     hitokoto_.Init(hwnd_, config_);
 
@@ -156,8 +172,41 @@ void CountdownWindow::OnCreate() {
     // 启动后立即显示第一句一言
     hitokoto_.FetchNext();
 
+    // 计划表：按程序打开时刻 + 配置周期建立下一次到期时间
+    RebuildSchedules(schedule::Scheduler::Now());
+
     // 启动定时器（常态 250ms；一言动画期间由 OnTimer 自动提速）
     timer_id_ = SetTimer(hwnd_, 1, 250, nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// 计划表
+// ---------------------------------------------------------------------------
+void CountdownWindow::RebuildSchedules(unsigned long long now) {
+    scheduler_.SetInterval(schedule::Hitokoto, now,
+        static_cast<unsigned long long>(config_.hitokotoRefreshSec) * 1000ULL,
+        config_.hitokotoRefreshSec > 0);
+    scheduler_.SetInterval(schedule::Article, now,
+        static_cast<unsigned long long>(config_.articleRefreshSec) * 1000ULL,
+        config_.articleEnabled && config_.articleRefreshSec > 0);
+    scheduler_.SetDueAt(schedule::DayChange,
+        now + schedule::MillisecondsToNextMidnight(), true);
+}
+
+void CountdownWindow::OnScheduleTick(unsigned long long now) {
+    if (scheduler_.Due(schedule::Hitokoto, now)) {
+        hitokoto_.FetchNext();
+        scheduler_.Advance(schedule::Hitokoto, now);
+    }
+    if (scheduler_.Due(schedule::Article, now)) {
+        article_.RefreshNow();
+        scheduler_.Advance(schedule::Article, now);
+    }
+    if (scheduler_.Due(schedule::DayChange, now)) {
+        article_.RefreshForDayChange();
+        scheduler_.SetDueAt(schedule::DayChange,
+            now + schedule::MillisecondsToNextMidnight(), true);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -207,11 +256,14 @@ void CountdownWindow::RebuildFonts() {
 }
 
 void CountdownWindow::DestroyFonts() {
+    ReleaseHitokotoLayer(); // 文本层引用了 fHk_，必须先释放
     if (fTitle_)   { DeleteObject(fTitle_);   fTitle_ = nullptr; }
     if (fContent_) { DeleteObject(fContent_); fContent_ = nullptr; }
     if (fTarget_)  { DeleteObject(fTarget_);  fTarget_ = nullptr; }
     if (fHk_)      { DeleteObject(fHk_);      fHk_ = nullptr; }
     fHkSize_ = 0;
+    fHkBoxW_ = 0;
+    fHkBoxH_ = 0;
     lastHkText_.clear();
     lastTargetText_.clear();
     contentCacheValid_ = false; // 字体变化，倒计时文本缓存一并失效
@@ -268,7 +320,7 @@ void CountdownWindow::Reposition() {
     std::wstring content = utils::FormatRemainingTime(
         rem, config_.displayFormat, config_.includeStartDay);
     std::wstring target = L"\u76ee\u6807\uff1a"
-                        + utils::FormatTargetTime(config_.EffectiveTargetTime());
+                        + utils::FormatTargetTime(targetCacheTm_);
 
     int textW = MeasureTextWidth(fContent_, content);
     textW = std::max(textW, MeasureTextWidth(fTitle_, config_.title));
@@ -327,14 +379,23 @@ void CountdownWindow::Reposition() {
 // ---------------------------------------------------------------------------
 // 剩余秒数计算
 // ---------------------------------------------------------------------------
-long long CountdownWindow::ComputeRemainingSeconds() const {
+void CountdownWindow::RefreshTargetCache() {
     // 循环开启时使用顺延后的生效目标；config 存储的是本地时间
-    std::tm local = config_.EffectiveTargetTime();
+    targetCacheTm_ = config_.EffectiveTargetTime();
+    std::tm local = targetCacheTm_;
     local.tm_isdst = -1; // 让运行时决定 DST
-    std::time_t target = std::mktime(&local);
+    targetCacheEpoch_ = std::mktime(&local);
+    targetCacheValid_ = true;
+}
 
+long long CountdownWindow::ComputeRemainingSeconds() {
     std::time_t now = std::time(nullptr);
-    return static_cast<long long>(target - now);
+    // 目标到达后（或配置变化后）才重新顺延，避免每秒跑逐月循环
+    if (!targetCacheValid_ ||
+        (config_.cycle != CycleUnit::None && now >= targetCacheEpoch_)) {
+        RefreshTargetCache();
+    }
+    return static_cast<long long>(targetCacheEpoch_ - now);
 }
 
 void CountdownWindow::RequestRedraw() {
@@ -380,8 +441,9 @@ void CountdownWindow::DrawHitokoto(HDC mem, int w, int h,
     int maxH = area.bottom - area.top;
     if (availW <= 0 || maxH <= 0) return;
 
-    const wchar_t* family = config_.font.empty()
-        ? L"Segoe UI" : config_.font.c_str();
+    const wchar_t* family = config_.hitokotoFont.empty()
+        ? L"Segoe UI" : config_.hitokotoFont.c_str();
+    int weight = config_.hitokotoBold ? FW_BOLD : FW_NORMAL;
 
     // 测量：该字体能否在区域内两行内放下
     auto fits = [&](HFONT font) -> bool {
@@ -394,14 +456,14 @@ void CountdownWindow::DrawHitokoto(HDC mem, int w, int h,
     };
 
     HFONT f = nullptr;
-    if (fHk_ && hk == lastHkText_) {
-        f = fHk_; // 文本未变：直接复用缓存字体（布局稳定时零 GDI 创建）
+    if (fHk_ && hk == lastHkText_ && fHkBoxW_ == availW && fHkBoxH_ == maxH) {
+        f = fHk_; // 文本与可用区域未变：直接复用缓存字体
     } else {
         // 文本变化：从基准字号向下试探，选择能放下的最大字号并缓存
         int size = std::max(11, config_.fontSize / 2);
         while (size >= 10) {
             // 使用灰度抗锯齿：文本层像素与文本色成线性关系，便于还原 alpha
-            HFONT tmp = CreateFontW(-S(size), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            HFONT tmp = CreateFontW(-S(size), 0, 0, 0, weight, FALSE, FALSE, FALSE,
                                     DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                                     CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
                                     DEFAULT_PITCH | FF_DONTCARE, family);
@@ -410,6 +472,8 @@ void CountdownWindow::DrawHitokoto(HDC mem, int w, int h,
                 if (fHk_) DeleteObject(fHk_);
                 fHk_ = tmp;
                 fHkSize_ = size;
+                fHkBoxW_ = availW;
+                fHkBoxH_ = maxH;
                 f = tmp;
                 break;
             }
@@ -447,42 +511,18 @@ void CountdownWindow::DrawHitokoto(HDC mem, int w, int h,
         return;
     }
 
-    // ---- 动画中：绘制到独立文本层（黑底）再逐像素合成 ----
-    HDC screen = GetDC(nullptr);
-    HDC tdc = CreateCompatibleDC(screen);
-    ReleaseDC(nullptr, screen);
-    if (!tdc) return;
-
-    BITMAPINFO bi{};
-    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth  = availW;
-    bi.bmiHeader.biHeight = -maxH; // top-down
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
-    bi.bmiHeader.biCompression = BI_RGB;
-    void* tbits = nullptr;
-    HBITMAP tex = CreateDIBSection(tdc, &bi, DIB_RGB_COLORS, &tbits, nullptr, 0);
-    if (!tex) { DeleteDC(tdc); return; }
-    memset(tbits, 0, (size_t)availW * maxH * 4); // 纯黑背景
-
-    HBITMAP oldT = (HBITMAP)SelectObject(tdc, tex);
-    HFONT oldF = (HFONT)SelectObject(tdc, f);
-    SetBkMode(tdc, TRANSPARENT);
-    // 文本层画白色：灰度 AA 下像素值即覆盖度，无需再按文本色通道换算
-    SetTextColor(tdc, RGB(255, 255, 255));
-    RECT trc = {0, 0, availW, maxH};
-    DrawTextW(tdc, hk.c_str(), -1, &trc,
-              DT_CENTER | DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL);
-    SelectObject(tdc, oldF);
+    // ---- 动画中：复用文本层（黑底白字），逐像素按 fade 合成 ----
+    if (!EnsureHitokotoLayer(availW, maxH, hk, f)) return;
 
     // 文本层为"黑底 + 白色文字"，像素亮度即覆盖度 cov：
     //   a = cov * fade / 255
     //   合成 = 背景 * (1 - a/255) + 文本色 * a/255；alpha 恒 255（背景不透明）
     int tStride = availW * 4;
+    const BYTE* tbits = static_cast<const BYTE*>(hkLayerBits_);
     for (int y = 0; y < maxH; ++y) {
         int ay = area.top + y;
         if (ay >= h) break;
-        const BYTE* tp = static_cast<const BYTE*>(tbits) + (size_t)y * tStride;
+        const BYTE* tp = tbits + (size_t)y * tStride;
         BYTE* q = base + (size_t)ay * stride + (size_t)area.left * 4;
         for (int x = 0; x < availW; ++x, tp += 4, q += 4) {
             int cov = tp[0]; // 灰度 AA：R=G=B
@@ -495,10 +535,72 @@ void CountdownWindow::DrawHitokoto(HDC mem, int w, int h,
             q[3] = 255; // 背景恒定不透明
         }
     }
+}
 
-    SelectObject(tdc, oldT);
-    DeleteObject(tex);
-    DeleteDC(tdc);
+// 文本/字号/区域不变时复用同一张文本层，避免 30ms 一帧反复创建 DIB
+bool CountdownWindow::EnsureHitokotoLayer(int w, int h,
+                                          const std::wstring& text, HFONT font) {
+    if (hkLayerDc_ && hkLayerBits_ && hkLayerW_ == w && hkLayerH_ == h &&
+        hkLayerText_ == text && hkLayerFont_ == font) {
+        return true;
+    }
+    ReleaseHitokotoLayer();
+
+    HDC screen = GetDC(nullptr);
+    hkLayerDc_ = CreateCompatibleDC(screen);
+    ReleaseDC(nullptr, screen);
+    if (!hkLayerDc_) return false;
+
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth  = w;
+    bi.bmiHeader.biHeight = -h; // top-down
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP bmp = CreateDIBSection(hkLayerDc_, &bi, DIB_RGB_COLORS,
+                                   &bits, nullptr, 0);
+    if (!bmp) {
+        ReleaseHitokotoLayer();
+        return false;
+    }
+    hkLayerBmp_ = bmp;
+    hkLayerBits_ = bits;
+    hkLayerOld_ = SelectObject(hkLayerDc_, bmp);
+    memset(bits, 0, (size_t)w * h * 4); // 纯黑背景
+
+    HFONT oldF = (HFONT)SelectObject(hkLayerDc_, font);
+    SetBkMode(hkLayerDc_, TRANSPARENT);
+    SetTextColor(hkLayerDc_, RGB(255, 255, 255));
+    RECT trc = {0, 0, w, h};
+    DrawTextW(hkLayerDc_, text.c_str(), -1, &trc,
+              DT_CENTER | DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL);
+    SelectObject(hkLayerDc_, oldF);
+
+    hkLayerW_ = w;
+    hkLayerH_ = h;
+    hkLayerText_ = text;
+    hkLayerFont_ = font;
+    return true;
+}
+
+void CountdownWindow::ReleaseHitokotoLayer() {
+    if (hkLayerDc_) {
+        if (hkLayerBmp_) {
+            SelectObject(hkLayerDc_, hkLayerOld_);
+            DeleteObject(hkLayerBmp_);
+        }
+        DeleteDC(hkLayerDc_);
+    }
+    hkLayerDc_   = nullptr;
+    hkLayerBmp_  = nullptr;
+    hkLayerOld_  = nullptr;
+    hkLayerBits_ = nullptr;
+    hkLayerW_ = 0;
+    hkLayerH_ = 0;
+    hkLayerText_.clear();
+    hkLayerFont_ = nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -621,7 +723,7 @@ void CountdownWindow::Render() {
         lastContent_ = utils::FormatRemainingTime(
             rem, config_.displayFormat, config_.includeStartDay);
         lastTargetText_ = L"\u76ee\u6807\uff1a"
-                        + utils::FormatTargetTime(config_.EffectiveTargetTime());
+                        + utils::FormatTargetTime(targetCacheTm_);
         contentCacheValid_ = true;
     }
     std::wstring content = lastContent_;
@@ -670,8 +772,9 @@ void CountdownWindow::Render() {
 // 定时器：推进一言动画/刷新并重绘
 // ---------------------------------------------------------------------------
 void CountdownWindow::OnTimer() {
-    hitokoto_.Tick();
-    article_.Tick();
+    unsigned long long now = schedule::Scheduler::Now();
+    hitokoto_.Tick(static_cast<DWORD>(now));
+    OnScheduleTick(now);
 
     // 一言切换动画期间提高刷新率（30ms），常态 250ms；
     // 间隔未变化时不再重复 SetTimer（每帧调用纯属冗余）
@@ -700,6 +803,7 @@ void CountdownWindow::OnDestroy() {
     tray_.Remove();
     if (icon_) DestroyIcon(icon_);
     DestroyFonts();
+    ReleaseHitokotoLayer();
     ReleaseDib();
 }
 
@@ -708,11 +812,14 @@ void CountdownWindow::OnDestroy() {
 // ---------------------------------------------------------------------------
 void CountdownWindow::ApplyConfig(const Config& cfg) {
     config_ = cfg;
+    targetCacheValid_ = false;
+    history::ApplyConfig(cfg); // 先应用清理策略，再写入新记录
     RebuildFonts();
     hitokoto_.ApplyConfig(cfg);
     tray_.SetTooltip(cfg.title);
     Reposition(); // 字号/一言区域可能变化，需重新布局
     article_.ApplyConfig(cfg); // 一文开关/位置/刷新配置
+    RebuildSchedules(schedule::Scheduler::Now());
 }
 
 // ---------------------------------------------------------------------------

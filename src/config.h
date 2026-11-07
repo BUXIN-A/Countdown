@@ -1,8 +1,15 @@
 // =============================================================================
-// config.h - 配置结构体与读写
+// config.h - 分组配置结构（schemaVersion = 2）
+//
+// 配置文件按功能分组，便于阅读与后续扩展：
+//   basic     基础设置（倒计时目标、窗口、启动、临时数据）
+//   countdown 倒计时外观（格式、字体、颜色）
+//   hitokoto  一言（来源、类型、刷新、字体、加粗）
+//   article   一文（内容、外观、布局、显示模块与模块配置）
 // =============================================================================
 #pragma once
 #include <string>
+#include <map>
 #include <ctime>
 #include "utils.h"
 
@@ -38,44 +45,86 @@ enum class ArticleSizeMode {
     Custom = 2,               // 手动指定宽高
 };
 
+// 临时数据清理逻辑：按记录项数 / 按文件大小
+enum class TempCleanupMode {
+    Count = 0,
+    Size  = 1,
+};
+
+// 达到上限后的处理方式
+enum class TempTrimMode {
+    ClearAll  = 0, // 清空全部记录
+    DropOldest = 1, // 删除最早 N 项
+};
+
+// 大小单位
+enum class TempSizeUnit {
+    MB = 0,
+    GB = 1,
+};
+
 struct Config {
-    std::wstring title;             // 倒计时标题
-    std::tm      targetTime{};      // 目标时间
+    // ---- basic：倒计时目标 ----
+    std::wstring title = L"";
+    std::tm      targetTime{};
+    CycleUnit    cycle = CycleUnit::Year;
+    bool         includeStartDay = false;
+    bool         autoStart = false;
+
+    // ---- basic：主窗口布局 ----
+    bool         isTop = false;
+    WindowAnchor anchor = WindowAnchor::TopCenter;
+    int          placeX = 0;
+    int          placeY = 0;
+
+    // ---- basic：临时数据清理 ----
+    TempCleanupMode tempCleanupMode = TempCleanupMode::Count;
+    TempSizeUnit    tempSizeUnit = TempSizeUnit::MB;
+    int             tempArticleLimit = 5000;   // 项数，或 MB/GB 数值
+    int             tempHitokotoLimit = 5000;  // 项数，或 MB/GB 数值
+    TempTrimMode    tempTrimMode = TempTrimMode::ClearAll;
+    int             tempTrimCount = 100;
+
+    // ---- countdown：外观 ----
     utils::DisplayFormat displayFormat = utils::DisplayFormat::HMS;
-    int          fontSize = 36;    // 字号（96 DPI 下的逻辑像素）
-    std::wstring font;             // 字体名
-    COLORREF     backgroundColor = RGB(20, 20, 30);  // 窗口背景色
-    COLORREF     textColor = RGB(235, 235, 245);      // 文字颜色
-    bool         includeStartDay = false; // 起始日是否计入倒计时（时间 +1 天）
-    CycleUnit    cycle = CycleUnit::None; // 循环单位（None=不循环）
+    int          fontSize = 36;       // 字号（96 DPI 逻辑像素）
+    std::wstring font = L"";          // 倒计时信息字体
+    COLORREF     backgroundColor = RGB(20, 20, 30);  // 倒计时背景
+    COLORREF     textColor = RGB(235, 235, 245);      // 倒计时文字
 
-    HitokotoSource hitokotoSource = HitokotoSource::Both; // 一言来源
-    // 网络一言句子类型代码（对应 hitokoto.cn 的 c 参数；空 = 全部）
-    std::string hitokotoCategory;
-    int hitokotoRefreshSec = 60;                          // 一言刷新间隔（秒）
+    // ---- hitokoto ----
+    HitokotoSource hitokotoSource = HitokotoSource::Both;
+    std::string hitokotoCategory;     // 网络句子类型代码（空=全部）
+    int          hitokotoRefreshSec = 60;
+    std::wstring hitokotoFont = L"";  // 一言独立字体
+    bool         hitokotoBold = false;
 
-    // 一文栏目（右侧长文卡片）
-    bool         articleEnabled = true;   // 是否显示一文栏目
-    WindowAnchor articleAnchor = WindowAnchor::CenterRight; // 一文位置模板
-    int          articlePlaceX = -24;    // 一文水平偏移（默认离右边缘留白）
-    int          articlePlaceY = 0;      // 一文垂直偏移
-    int          articleRefreshSec = 300; // 一文刷新间隔（秒）
-    bool         articleIsTop = false;   // 一文是否始终置顶（独立于倒计时）
-    int          articleFontSize = 15;   // 一文正文字号（96 DPI 逻辑像素）
+    // ---- article：内容 ----
+    bool         articleEnabled = true;
+    int          articleRefreshSec = 300;
+    int          articleFontSize = 15;
+    std::wstring articleFont = L"";
+    COLORREF     articleBackgroundColor = RGB(20, 20, 30);
+    COLORREF     articleTextColor = RGB(235, 235, 245);
+
+    // ---- article：布局 ----
+    WindowAnchor articleAnchor = WindowAnchor::CenterRight;
+    int          articlePlaceX = -24;
+    int          articlePlaceY = 0;
     ArticleSizeMode articleSizeMode = ArticleSizeMode::FixedWidthAutoHeight;
-    int          articleWidth = 380;     // 一文宽度（固定宽/自定义模式）
-    int          articleHeight = 480;    // 一文高度（自定义模式）
+    int          articleWidth = 380;
+    int          articleHeight = 480;
+    bool         articleIsTop = false;
 
-    bool         isTop    = false;   // 窗口是否始终置顶（true=压过全屏/置顶应用）
-    WindowAnchor anchor   = WindowAnchor::TopCenter; // 窗口位置模板（默认顶部居中）
-    int          placeX   = 0;       // 相对模板位置的水平偏移（像素，可为负）
-    int          placeY   = 0;       // 相对模板位置的垂直偏移（像素，可为负）
-    bool         autoStart = false;  // 是否开机自启动（HKCU Run）
+    // ---- article：显示模块 ----
+    std::wstring articleModule = L"normal"; // 当前显示模块 id
+    // 各模块配置（UTF-8 JSON 对象字符串），切换模块不会丢失已配置内容
+    std::map<std::string, std::string> articleModuleConfigs;
 
     // 返回默认配置（目标 = 2000-06-07，按年循环作为周年倒计时）
     static Config Defaults();
 
-    // 从 exe 同目录 config.json 加载；失败则写入默认配置
+    // 从 exe 同目录 config.json 加载；版本不符时写入默认配置
     static Config Load();
 
     // 保存到 exe 同目录 config.json
@@ -83,4 +132,13 @@ struct Config {
 
     // 当前生效的目标时间：循环开启且原目标已过时，按单位顺延到未来
     std::tm EffectiveTargetTime() const;
+
+    // 读取/写入某模块的配置 JSON（始终返回合法 JSON 对象）
+    std::string ArticleModuleConfig(const std::wstring& moduleId) const;
+    void SetArticleModuleConfig(const std::wstring& moduleId,
+                                const std::string& json);
+
+    // 临时上限换算为字节数（size 模式使用）
+    long long TempArticleLimitBytes() const;
+    long long TempHitokotoLimitBytes() const;
 };
