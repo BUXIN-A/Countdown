@@ -26,6 +26,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -85,6 +86,9 @@ enum UpdateButtonId {
     BtnLineMirror,
     BtnRetryMirror,
     BtnRetryDirect,
+    BtnInstall,
+    BtnInstallStart,
+    BtnInstallCancel,
     BtnAssetBase = 1000,
 };
 
@@ -140,6 +144,7 @@ enum class UpdateStage {
     Downloading,
     DownloadFailed,
     Done,
+    ConfirmInstall,
     Failed,
 };
 
@@ -350,6 +355,104 @@ static std::wstring MakeUniquePath(const std::wstring& dir,
         if (n > 999) break;
     }
     return candidate;
+}
+
+// ---------------------------------------------------------------------------
+// 自动安装（替换程序文件）
+// ---------------------------------------------------------------------------
+static bool IsZipFile(const std::wstring& path) {
+    if (path.size() < 4) return false;
+    return lstrcmpiW(path.c_str() + path.size() - 4, L".zip") == 0;
+}
+
+static bool CanWriteToDir(const std::wstring& dir) {
+    std::wstring probe = dir + L".countdown_write_test";
+    HANDLE h = CreateFileW(probe.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
+                           nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    CloseHandle(h);
+    return true;
+}
+
+static std::wstring ExeFileName() {
+    wchar_t buf[MAX_PATH] = {0};
+    DWORD len = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) return L"Countdown.exe";
+    std::wstring path(buf, len);
+    size_t slash = path.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? path : path.substr(slash + 1);
+}
+
+// 更新脚本：等待本进程退出 -> 解压到临时目录 -> 备份并覆盖 -> 启动新版本。
+// 脚本保持纯 ASCII，路径通过命令行参数传入，避免代码页问题。
+static const char kInstallScript[] = R"PS(
+param(
+  [int]$ParentPid,
+  [string]$ZipPath,
+  [string]$TargetDir,
+  [string]$ExeName
+)
+$ErrorActionPreference = 'Continue'
+$log = Join-Path $env:TEMP 'countdown_update.log'
+function WriteLog([string]$m) {
+  try { Add-Content -LiteralPath $log -Value ("[" + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + "] " + $m) -Encoding UTF8 } catch {}
+}
+try {
+  try { Wait-Process -Id $ParentPid -Timeout 120 -ErrorAction Stop } catch {}
+  Start-Sleep -Milliseconds 600
+
+  $work = Join-Path $env:TEMP ("cd_update_" + [Guid]::NewGuid().ToString('N'))
+  New-Item -ItemType Directory -Path $work -Force | Out-Null
+  Expand-Archive -LiteralPath $ZipPath -DestinationPath $work -Force
+  WriteLog ("extracted: " + $work)
+
+  $skip = @('config.json')
+  $files = Get-ChildItem -LiteralPath $work -Recurse -File
+  foreach ($f in $files) {
+    $rel = $f.FullName.Substring($work.Length).TrimStart('\')
+    if ($skip -contains $rel.ToLowerInvariant()) { continue }
+    $dest = Join-Path $TargetDir $rel
+    $destDir = Split-Path -Parent $dest
+    if (-not (Test-Path -LiteralPath $destDir)) { New-Item -ItemType Directory -Path $destDir -Force | Out-Null }
+    if (Test-Path -LiteralPath $dest) {
+      $bak = $dest + '.old'
+      if (Test-Path -LiteralPath $bak) { Remove-Item -LiteralPath $bak -Force -ErrorAction SilentlyContinue }
+      Move-Item -LiteralPath $dest -Destination $bak -Force
+    }
+    Copy-Item -LiteralPath $f.FullName -Destination $dest -Force
+  }
+  WriteLog "files copied"
+  Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+  Start-Process -FilePath (Join-Path $TargetDir $ExeName) -WorkingDirectory $TargetDir
+  WriteLog ("restarted: " + $ExeName)
+} catch {
+  WriteLog ("failed: " + $_.Exception.Message)
+  try {
+    $backups = Get-ChildItem -LiteralPath $TargetDir -Recurse -Filter *.old -File -ErrorAction SilentlyContinue
+    foreach ($b in $backups) {
+      $orig = $b.FullName.Substring(0, $b.FullName.Length - 4)
+      Copy-Item -LiteralPath $b.FullName -Destination $orig -Force -ErrorAction SilentlyContinue
+    }
+    WriteLog "restored backups"
+  } catch {}
+  try {
+    Start-Process -FilePath (Join-Path $TargetDir $ExeName) -WorkingDirectory $TargetDir
+    WriteLog "restarted after failure"
+  } catch { WriteLog "restart failed" }
+}
+)PS";
+
+static bool WriteAsciiFile(const std::wstring& path, const char* text) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD written = 0;
+    size_t len = strlen(text);
+    bool ok = WriteFile(h, text, static_cast<DWORD>(len), &written, nullptr) &&
+              written == len;
+    CloseHandle(h);
+    return ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -762,8 +865,10 @@ static void BuildButtons(UpdateState* st, int w, int h) {
         case UpdateStage::Done:
         case UpdateStage::DownloadFailed:
             if (st->stage == UpdateStage::Done) {
+                bool canInstall = IsZipFile(st->savedPath);
+                if (canInstall) rightBtn(BtnInstall, 116, L"安装并重启", true, cursor);
+                rightBtn(BtnOpenFolder, 116, L"打开文件夹", !canInstall, cursor);
                 rightBtn(BtnClose, 88, L"关闭", false, cursor);
-                rightBtn(BtnOpenFolder, 116, L"打开文件夹", true, cursor);
             } else if (st->stage == UpdateStage::DownloadFailed) {
                 rightBtn(BtnClose, 88, L"关闭", false, cursor);
                 rightBtn(BtnManual, 112, L"手动下载", true, cursor);
@@ -811,6 +916,10 @@ static void BuildButtons(UpdateState* st, int w, int h) {
             break;
         case UpdateStage::Downloading:
             rightBtn(BtnCancelDownload, 96, L"取消", false, cursor);
+            break;
+        case UpdateStage::ConfirmInstall:
+            rightBtn(BtnInstallStart, 116, L"安装并重启", true, cursor);
+            rightBtn(BtnInstallCancel, 88, L"取消", false, cursor);
             break;
         case UpdateStage::Failed:
             rightBtn(BtnClose, 88, L"关闭", false, cursor);
@@ -1145,6 +1254,49 @@ static void DrawDone(UpdateState* st, HDC dc, int w, int h) {
                    lineRc, st->smallFont, kMuted,
                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
+    if (IsZipFile(st->savedPath)) {
+        int hintY = st->S(kHeaderH + (st->lastUsedMirror ? 186 : 156));
+        RECT hintRc{st->S(kPad), hintY, w - st->S(kPad), hintY + st->S(24)};
+        DrawTextIn(dc, L"可直接点击「安装并重启」自动替换程序文件。", hintRc,
+                   st->smallFont, kMuted,
+                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+}
+
+static void DrawConfirmInstall(UpdateState* st, HDC dc, int w, int h) {
+    RECT titleRc{st->S(kPad), st->S(kHeaderH + 16), w - st->S(kPad),
+                 st->S(kHeaderH + 46)};
+    DrawTextIn(dc, L"安装更新并重启", titleRc, st->titleFont, kValueText,
+               DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    int y = st->S(kHeaderH + 58);
+    RECT line1{st->S(kPad), y, w - st->S(kPad), y + st->S(24)};
+    DrawTextIn(dc, L"将关闭程序，并用压缩包内的文件覆盖安装目录：", line1,
+               st->font, kLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    y += st->S(28);
+    RECT dirRc{st->S(kPad), y, w - st->S(kPad), y + st->S(24)};
+    DrawTextIn(dc, utils::GetExeDir(), dirRc, st->boldFont, kValueText,
+               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+    y += st->S(34);
+    RECT noteRc{st->S(kPad), y, w - st->S(kPad), y + st->S(66)};
+    DrawTextIn(dc,
+               L"config.json 会保留；被替换的旧文件备份为 .old，"
+               L"新版本启动成功后自动清理。\n更新完成后程序会自动重新启动。",
+               noteRc, st->smallFont, kMuted, DT_LEFT | DT_WORDBREAK);
+
+    y += st->S(76);
+    RECT zipRc{st->S(kPad), y, w - st->S(kPad), y + st->S(22)};
+    DrawTextIn(dc, L"安装包：" + st->savedPath, zipRc, st->smallFont, kMuted,
+               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+    if (!st->errorText.empty()) {
+        RECT errRc{st->S(kPad), y + st->S(30), w - st->S(kPad),
+                   y + st->S(96)};
+        DrawTextIn(dc, st->errorText, errRc, st->font, kDanger,
+                   DT_LEFT | DT_WORDBREAK);
+    }
 }
 
 static void DrawFailed(UpdateState* st, HDC dc, int w, int h) {
@@ -1178,6 +1330,7 @@ static void PaintWindow(UpdateState* st, HDC dc, int w, int h) {
         case UpdateStage::Downloading: title = L"下载更新"; break;
         case UpdateStage::DownloadFailed: title = L"下载更新"; break;
         case UpdateStage::Done: title = L"下载更新"; break;
+        case UpdateStage::ConfirmInstall: title = L"安装更新"; break;
         case UpdateStage::Failed: title = L"检查更新"; break;
         default: title = L"检查更新"; break;
     }
@@ -1213,6 +1366,7 @@ static void PaintWindow(UpdateState* st, HDC dc, int w, int h) {
         case UpdateStage::Downloading:    DrawDownloading(st, dc, w, h); break;
         case UpdateStage::DownloadFailed: DrawDownloadFailed(st, dc, w, h); break;
         case UpdateStage::Done:           DrawDone(st, dc, w, h); break;
+        case UpdateStage::ConfirmInstall: DrawConfirmInstall(st, dc, w, h); break;
         case UpdateStage::Failed:         DrawFailed(st, dc, w, h); break;
     }
 
@@ -1288,6 +1442,71 @@ static void StartDownload(UpdateState* st, int index) {
     InvalidateRect(st->hwnd, nullptr, TRUE);
 }
 
+// 启动安装脚本并退出当前进程。失败时写入 errorText 并返回 false。
+static bool PerformInstall(UpdateState* st) {
+    const std::wstring zip = st->savedPath;
+    if (zip.empty() || GetFileAttributesW(zip.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        st->errorText = L"安装包不存在，请重新下载。";
+        return false;
+    }
+    if (!IsZipFile(zip)) {
+        st->errorText = L"该附件不是 zip 压缩包，无法自动安装，请手动处理。";
+        return false;
+    }
+
+    std::wstring target = utils::GetExeDir();
+    // 去掉尾部反斜杠：否则命令行参数里的 "C:\dir\" 会把结尾引号转义
+    while (target.size() > 3 &&
+           (target.back() == L'\\' || target.back() == L'/')) {
+        target.pop_back();
+    }
+    if (target.empty() || !CanWriteToDir(target + L"\\")) {
+        st->errorText = L"安装目录不可写。请以管理员身份运行本程序，或手动解压覆盖。";
+        return false;
+    }
+
+    wchar_t tempDir[MAX_PATH] = {0};
+    DWORD n = GetTempPathW(MAX_PATH, tempDir);
+    if (n == 0 || n >= MAX_PATH) {
+        st->errorText = L"无法获取临时目录，安装未开始。";
+        return false;
+    }
+    std::wstring scriptPath = std::wstring(tempDir) + L"countdown_update_" +
+                              std::to_wstring(GetCurrentProcessId()) + L".ps1";
+    DeleteFileW(scriptPath.c_str());
+    if (!WriteAsciiFile(scriptPath, kInstallScript)) {
+        st->errorText = L"无法写入更新脚本（临时目录不可写）。";
+        return false;
+    }
+
+    std::wstring cmd =
+        L"powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"";
+    cmd += scriptPath;
+    cmd += L"\" -ParentPid " + std::to_wstring(GetCurrentProcessId());
+    cmd += L" -ZipPath \"" + zip + L"\"";
+    cmd += L" -TargetDir \"" + target + L"\"";
+    cmd += L" -ExeName \"" + ExeFileName() + L"\"";
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
+    cmdBuf.push_back(L'\0');
+    BOOL ok = CreateProcessW(nullptr, cmdBuf.data(), nullptr, nullptr, FALSE,
+                             CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    if (!ok) {
+        st->errorText = L"无法启动安装脚本，请手动解压压缩包覆盖。";
+        return false;
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+
+    // 退出程序：脚本会在进程结束后替换文件并重新启动
+    PostQuitMessage(0);
+    DestroyWindow(st->hwnd);
+    return true;
+}
+
 static void DoButtonAction(UpdateState* st, int id) {
     if (id == BtnNone) return;
     if (id >= BtnAssetBase) {
@@ -1338,6 +1557,20 @@ static void DoButtonAction(UpdateState* st, int id) {
             if (st->lastAssetIndex >= 0) {
                 st->useMirror = false;
                 StartDownload(st, st->lastAssetIndex);
+            }
+            break;
+        case BtnInstall:
+            st->errorText.clear();
+            st->stage = UpdateStage::ConfirmInstall;
+            InvalidateRect(st->hwnd, nullptr, TRUE);
+            break;
+        case BtnInstallCancel:
+            st->stage = UpdateStage::Done;
+            InvalidateRect(st->hwnd, nullptr, TRUE);
+            break;
+        case BtnInstallStart:
+            if (!PerformInstall(st)) {
+                InvalidateRect(st->hwnd, nullptr, TRUE);
             }
             break;
         case BtnRetry:

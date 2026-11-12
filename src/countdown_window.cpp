@@ -16,6 +16,24 @@
 // Explorer 重启后广播的注册消息：收到后需重新添加托盘图标
 static UINT g_taskbarCreatedMsg = 0;
 
+// 自动更新替换文件时会把旧文件备份为 *.old；新版本启动成功即清理这些备份
+static void DeleteUpdateBackups(const std::wstring& dirWithSlash) {
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW((dirWithSlash + L"*.old").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        DeleteFileW((dirWithSlash + fd.cFileName).c_str());
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+static void CleanupUpdateBackups() {
+    std::wstring exeDir = utils::GetExeDir(); // 含末尾反斜杠
+    DeleteUpdateBackups(exeDir);
+    DeleteUpdateBackups(exeDir + L"lib\\article\\");
+}
+
 // ---------------------------------------------------------------------------
 // 窗口类注册
 // ---------------------------------------------------------------------------
@@ -177,6 +195,9 @@ void CountdownWindow::OnCreate() {
 
     // 启动定时器（常态 250ms；一言动画期间由 OnTimer 自动提速）
     timer_id_ = SetTimer(hwnd_, 1, 250, nullptr);
+
+    // 走到这里说明新版本已正常启动：清理自动更新留下的 .old 备份
+    CleanupUpdateBackups();
 }
 
 // ---------------------------------------------------------------------------
