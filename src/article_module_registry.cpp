@@ -65,6 +65,8 @@ void ArticleModuleRegistry::LoadAll() {
         entry.destroy = GetExport<ArticleModuleDestroyFn>(lib, "ArticleModule_Destroy");
         entry.applyConfig = GetExport<ArticleModuleApplyConfigFn>(lib, "ArticleModule_ApplyConfig");
         entry.select = GetExport<ArticleModuleSelectFn>(lib, "ArticleModule_Select");
+        entry.getRefreshSeconds = GetExport<ArticleModuleGetRefreshSecondsFn>(
+            lib, "ArticleModule_GetRefreshSeconds");
 
         const ArticleModuleInfo* info =
             entry.getInfo ? entry.getInfo() : nullptr;
@@ -146,5 +148,14 @@ int ArticleModuleInstance::Select(int currentIndex, int reason) {
         return entry_->select(handle_, currentIndex, reason);
     } catch (...) {
         return -1;
+    }
+}
+
+int ArticleModuleInstance::RefreshSeconds() const {
+    if (!Valid() || !entry_->getRefreshSeconds) return 0;
+    try {
+        return std::max(0, entry_->getRefreshSeconds(handle_));
+    } catch (...) {
+        return 0;
     }
 }

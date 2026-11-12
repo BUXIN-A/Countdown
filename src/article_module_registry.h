@@ -25,6 +25,8 @@ struct ArticleModuleEntry {
     ArticleModuleDestroyFn       destroy = nullptr;
     ArticleModuleApplyConfigFn   applyConfig = nullptr;
     ArticleModuleSelectFn        select = nullptr;
+    // 可选导出；为空表示该模块不参与定时刷新
+    ArticleModuleGetRefreshSecondsFn getRefreshSeconds = nullptr;
 
     bool Valid() const {
         return library && !id.empty() && create && destroy &&
@@ -62,6 +64,8 @@ public:
     void Destroy();
     void ApplyConfig(const std::string& json);
     int Select(int currentIndex, int reason);
+    // 模块期望的自动刷新间隔（秒）；0 表示不自动刷新
+    int RefreshSeconds() const;
     bool Valid() const { return entry_ != nullptr && handle_ != nullptr; }
     const std::wstring& Id() const {
         static const std::wstring kEmpty;

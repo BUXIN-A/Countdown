@@ -3,25 +3,36 @@
 //
 // 行为：随机选择一篇未显示过的文章；全部看过后清空记录重新开始；
 // 定时刷新时避免与当前文章连续重复。
-// 无可配置项（刷新时间由宿主“一文”设置统一控制）。
+// 刷新间隔由本模块自己声明（refreshSec，0 = 不自动刷新）。
 // =============================================================================
 #include "../article_module_api.h"
+#include "../json.h"
 
 #include <windows.h>
+#include <algorithm>
+#include <cstdlib>
 #include <string>
 #include <vector>
-#include <algorithm>
 
 namespace {
 
+const int kDefaultRefreshSec = 300;
+
 struct NormalModule {
     const ArticleModuleHostApi* host = nullptr;
+    int refreshSec = kDefaultRefreshSec;
 };
 
 const wchar_t kId[]          = L"normal";
 const wchar_t kName[]        = L"普通";
 const wchar_t kDescription[] = L"\u968f\u673a\u5207\u6362\u4e00\u6587\uff0c\u5c3d\u91cf\u4e0d\u91cd\u590d";
-const char    kSchema[]      = "{\"items\":[]}";
+const char    kSchema[] =
+    "{\"items\":["
+    "{\"key\":\"refreshSec\",\"type\":\"int\","
+    "\"label\":\"\u5237\u65b0\u65f6\u95f4\uff08\u79d2\uff09\","
+    "\"hint\":\"\u9694\u591a\u5c11\u79d2\u81ea\u52a8\u6362\u4e00\u7bc7\uff1b0 = \u4e0d\u81ea\u52a8\u5237\u65b0\","
+    "\"min\":0,\"max\":86400,\"step\":30,\"default\":300}"
+    "]}";
 
 int Pick(NormalModule* m, int currentIndex) {
     const ArticleModuleHostApi* h = m->host;
@@ -80,8 +91,29 @@ ARTICLE_MODULE_EXPORT void ArticleModule_Destroy(void* module) {
     delete static_cast<NormalModule*>(module);
 }
 
-ARTICLE_MODULE_EXPORT void ArticleModule_ApplyConfig(void*, const char*) {
-    // 无配置项
+ARTICLE_MODULE_EXPORT void ArticleModule_ApplyConfig(void* module, const char* json) {
+    NormalModule* m = static_cast<NormalModule*>(module);
+    if (!m) return;
+    m->refreshSec = kDefaultRefreshSec;
+    if (!json || !json[0]) return;
+    try {
+        mini_json::Value root = mini_json::Value::parse(json);
+        if (const mini_json::Value* v = root.find("refreshSec")) {
+            int sec = static_cast<int>(v->as_number(kDefaultRefreshSec));
+            if (sec < 0) sec = 0;
+            if (sec > 86400) sec = 86400;
+            m->refreshSec = sec;
+        }
+    } catch (...) {
+        // 配置异常时退回默认值，避免影响显示
+        m->refreshSec = kDefaultRefreshSec;
+    }
+}
+
+// 可选导出：宿主据此决定定时刷新间隔
+ARTICLE_MODULE_EXPORT int ArticleModule_GetRefreshSeconds(void* module) {
+    NormalModule* m = static_cast<NormalModule*>(module);
+    return m ? m->refreshSec : 0;
 }
 
 ARTICLE_MODULE_EXPORT int ArticleModule_Select(void* module, int currentIndex,

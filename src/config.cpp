@@ -352,8 +352,13 @@ Config Config::Load() {
 
         if (const J* art = SubObject(root, "article")) {
             c.articleEnabled = BoolValue(*art, "enabled", c.articleEnabled);
-            int sec = IntValue(*art, "refreshSec", c.articleRefreshSec);
-            if (sec >= 1 && sec <= 86399) c.articleRefreshSec = sec;
+            // refreshSec 已迁移到各模块自己的配置（normal 模块声明）；
+            // 这里读取旧值，稍后写入 normal 模块配置，避免升级后行为突变
+            int legacyRefreshSec = 0;
+            if (const J* v = art->find("refreshSec")) {
+                int sec = static_cast<int>(v->as_number(0));
+                if (sec > 0 && sec <= 86400) legacyRefreshSec = sec;
+            }
             int fs = IntValue(*art, "fontSize", c.articleFontSize);
             if (fs >= 8 && fs <= 96) c.articleFontSize = fs;
             if (const J* v = art->find("font")) {
@@ -391,6 +396,23 @@ Config Config::Load() {
                         c.articleModuleConfigs[kv.first] =
                             J::serialize(kv.second, false);
                     }
+                }
+            }
+
+            if (legacyRefreshSec > 0) {
+                auto it = c.articleModuleConfigs.find("normal");
+                std::string normalJson =
+                    (it == c.articleModuleConfigs.end()) ? "{}" : it->second;
+                try {
+                    J module = J::parse(normalJson);
+                    if (module.is_object() && !module.find("refreshSec")) {
+                        mini_json::Object obj = module.as_object();
+                        obj.emplace_back("refreshSec", J(legacyRefreshSec));
+                        c.articleModuleConfigs["normal"] =
+                            J::serialize(J(std::move(obj)), false);
+                    }
+                } catch (...) {
+                    // 旧配置无法解析时忽略迁移，模块会使用自身默认值
                 }
             }
         }
@@ -470,7 +492,6 @@ bool Config::Save() const {
     {
         mini_json::Object art;
         art.emplace_back("enabled", J(articleEnabled));
-        art.emplace_back("refreshSec", J(articleRefreshSec));
         art.emplace_back("fontSize", J(articleFontSize));
         art.emplace_back("font", J(utils::WideToUtf8(articleFont)));
         art.emplace_back("backgroundColor", J(utils::ColorToHex(articleBackgroundColor)));

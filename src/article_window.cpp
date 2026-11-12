@@ -409,6 +409,12 @@ void ArticleWindow::RefreshForDayChange() {
     }
 }
 
+int ArticleWindow::RefreshSeconds() const {
+    // 模块自行声明刷新节奏；week 等不导出的模块视为“只在跨天刷新”
+    if (module_.Valid()) return module_.RefreshSeconds();
+    return 300; // 模块缺失时的内置随机回退仍按默认间隔换文
+}
+
 // 随机选一篇未显示过的文章；全部显示过则清空记录开始新一轮
 size_t ArticleWindow::PickRandomUnseen() {
     if (articles_.empty()) return 0;

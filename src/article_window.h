@@ -28,6 +28,8 @@ public:
     void RefreshNow();
     // 本地零点：week 模块需要按新星期重新评估
     void RefreshForDayChange();
+    // 自动刷新间隔（秒），由当前模块声明；0 = 不自动刷新
+    int  RefreshSeconds() const;
 
     // 重新定位（配置/DPI/倒计时位置变化后调用）
     void Reposition();

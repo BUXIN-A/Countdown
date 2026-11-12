@@ -35,7 +35,7 @@
 - 独立窗口，位置用九宫格锚点 + 像素偏移定位，可单独设置置顶
 - 尺寸模式：固定宽自适应高 / 完全自适应 / 自定义宽高
 - 独立字体、字号、背景色与文字颜色
-- 刷新间隔可配置
+- 刷新节奏由显示模块自己声明（在「模块设置」中调整间隔）
 
 ### 一文显示模块（DLL）
 
@@ -45,8 +45,8 @@
 
 | 模块 | 说明 |
 | --- | --- |
-| `normal` | 随机显示：从未看过的文章中随机抽取 |
-| `week` | 星期时段：同一星期范围内固定显示同一篇，范围不能重叠；当天不属于任何范围时隐藏一文窗口 |
+| `normal` | 随机显示：从未看过的文章中随机抽取，刷新间隔在其模块设置中调整 |
+| `week` | 星期时段：同一星期范围内固定显示同一篇，范围不能重叠；当天不属于任何范围时隐藏一文窗口（只在跨天时刷新） |
 
 模块放在 `lib\article\` 目录，启动时自动扫描。未找到任何模块时，一文回退为内置随机逻辑。
 
@@ -140,9 +140,9 @@ build\lib\article\week.dll
 | 分组 | 内容 |
 | --- | --- |
 | `basic` | 倒计时目标、主窗口布局、开机自启动、临时数据清理策略 |
-| `countdown` | 倒计时显示格式、字体、字号、背景色、文字色 |
+| `countdown` | 倒计时显示格式、字体、字号、背景色、文字色、窗口尺寸与圆角 |
 | `hitokoto` | 一言来源、句子类型、刷新间隔、字体、加粗 |
-| `article` | 一文开关、刷新间隔、外观、布局，以及当前使用的显示模块与其配置 |
+| `article` | 一文开关、外观、布局，以及当前使用的显示模块与其配置（含刷新间隔） |
 
 各模块的配置分别保存在 `article.modules.<模块id>` 下，切换模块不会丢失已配置内容。
 
@@ -161,10 +161,13 @@ void*                    ArticleModule_Create(const ArticleModuleHostApi* host);
 void                     ArticleModule_Destroy(void* module);
 void                     ArticleModule_ApplyConfig(void* module, const char* json);
 int                      ArticleModule_Select(void* module, int current_index, int reason);
+// 可选：返回自动刷新间隔（秒），0 = 不参与定时刷新
+int                      ArticleModule_GetRefreshSeconds(void* module);
 ```
 
 - 宿主通过 `ArticleModuleHostApi` 提供文章池、已显示记录、临时目录、本地时间与随机数
 - 模块通过 `ArticleModule_GetConfigSchema` 返回 schema JSON 声明自己的可配置项，设置界面由宿主按类型自动生成，**新增模块无需修改宿主代码**
+- 刷新间隔由模块自己决定：导出 `ArticleModule_GetRefreshSeconds` 的模块按返回的秒数定时刷新，未导出则只在跨天时刷新
 - 支持的配置项类型：`bool`、`int`、`choice`、`dayRangeList`
 
 接口定义见 [`src/article_module_api.h`](src/article_module_api.h)，示例实现见：
@@ -195,7 +198,7 @@ src/
   utils.cpp/.h                 DPI、字体、颜色、网络等工具
   json.h                       轻量 JSON 解析/序列化
   version.h.in / version.rc.in 版本号模板（CMake 生成）
-CMakeLists.txt                 构建脚本（exe + 模块 DLL）
+CMakeLists.txt                 构建脚本（exe + 模块 DLL）；版本号与仓库地址的唯一配置入口
 resource.h / resource.rc       图标、控件 ID、自定义消息
 countdown.ico                  应用图标
 app.manifest                   DPI 感知与主题清单

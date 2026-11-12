@@ -1,5 +1,14 @@
 cmake_minimum_required(VERSION 3.15)
-project(Countdown VERSION 2.3.1 LANGUAGES CXX)
+project(Countdown VERSION 2.3.2 LANGUAGES CXX)
+
+# -----------------------------------------------------------------------------
+# 统一配置入口：版本号、仓库信息只在这里维护
+# 版本号由 project(VERSION) 提供；其余派生宏写入 generated/version.h
+# -----------------------------------------------------------------------------
+set(APP_REPO_OWNER "BUXIN-A")
+set(APP_REPO_NAME  "Countdown")
+set(APP_AUTHOR      "Bu Xin")
+
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

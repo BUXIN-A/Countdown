@@ -186,9 +186,11 @@ void CountdownWindow::RebuildSchedules(unsigned long long now) {
     scheduler_.SetInterval(schedule::Hitokoto, now,
         static_cast<unsigned long long>(config_.hitokotoRefreshSec) * 1000ULL,
         config_.hitokotoRefreshSec > 0);
+    // 一文刷新节奏由当前模块声明（见 ArticleModule_GetRefreshSeconds）
+    const int articleSec = article_.RefreshSeconds();
     scheduler_.SetInterval(schedule::Article, now,
-        static_cast<unsigned long long>(config_.articleRefreshSec) * 1000ULL,
-        config_.articleEnabled && config_.articleRefreshSec > 0);
+        static_cast<unsigned long long>(articleSec) * 1000ULL,
+        config_.articleEnabled && articleSec > 0);
     scheduler_.SetDueAt(schedule::DayChange,
         now + schedule::MillisecondsToNextMidnight(), true);
 }

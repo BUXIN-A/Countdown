@@ -171,6 +171,7 @@ struct SettingsState {
 
     HWND pageViews[kTabCount] = {};
     int  pageScroll[kTabCount] = {};
+    int  pageAppliedScroll[kTabCount] = {-1, -1, -1, -1};
     int  pageContentH[kTabCount] = {};
     int  contentW = 0;
     int  viewH = 0;
@@ -213,7 +214,6 @@ struct SettingsState {
     HWND hBtnArtAnchor = nullptr;
     HWND hEditArtX = nullptr;
     HWND hEditArtY = nullptr;
-    HWND hEditArtH = nullptr;
     HWND hEditArtM = nullptr;
     HWND hEditArtS = nullptr;
     HWND hBtnArtTop = nullptr;
@@ -270,6 +270,12 @@ struct SettingsState {
     int dragPage = -1;
     int dragStartY = 0;
     int dragStartScroll = 0;
+
+    // 页面内容拖动滚动（触摸或鼠标按住拖动）
+    int  contentDragPage = -1;
+    int  contentDragStartY = 0;
+    int  contentDragStartScroll = 0;
+    bool contentDragMoved = false;
 
     std::vector<DropdownDef> dropdowns;
     std::vector<NumberField> numbers;
@@ -810,13 +816,19 @@ static void ApplyScroll(SettingsState* st, int page) {
     if (st->pageScroll[page] < 0) st->pageScroll[page] = 0;
     if (st->pageScroll[page] > maxScroll) st->pageScroll[page] = maxScroll;
     int offset = st->pageScroll[page];
+    // 偏移未变化时不必重绘（拖动到两端会频繁触发）
+    if (st->pageAppliedScroll[page] == offset) return;
+    st->pageAppliedScroll[page] = offset;
+    // 移动时不逐个重绘子控件：位置全部更新完后，整页与子控件一次性重绘，
+    // 避免滚动过程中出现旧位置与新位置交错的撕裂画面。
     for (const PageControlPos& pos : st->pageCtls[page]) {
-        if (pos.hwnd) {
-            SetWindowPos(pos.hwnd, nullptr, pos.x, pos.baseY - offset, 0, 0,
-                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-        }
+        if (!pos.hwnd) continue;
+        SetWindowPos(pos.hwnd, nullptr, pos.x, pos.baseY - offset, 0, 0,
+                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
     }
-    InvalidateRect(st->pageViews[page], nullptr, TRUE);
+    HWND pageWnd = st->pageViews[page];
+    RedrawWindow(pageWnd, nullptr, nullptr,
+                 RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
 }
 
 static void ScrollPageBy(SettingsState* st, int page, int delta) {
@@ -1087,7 +1099,7 @@ static void PaintAbout(HDC dc, SettingsState* st, int w, int h) {
     // 更新地址（与“获取更新”按钮垂直对齐，按钮由 OnCreate 创建）
     RECT urlRc{st->S(160), st->S(140), w - st->S(8), st->S(170)};
     SetTextColor(dc, kMuted);
-    DrawTextW(dc, APP_UPDATE_URL, -1, &urlRc,
+    DrawTextW(dc, APP_REPO_URL, -1, &urlRc,
               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX
                   | DT_END_ELLIPSIS);
     SelectObject(dc, old);
@@ -1942,30 +1954,58 @@ static LRESULT CALLBACK PageWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             CloseDropdown(st);
             CloseCalendarPopup(st);
+            // 触摸屏/鼠标按住拖动滚动：记录起点，移动超过阈值后才真正滚动
+            if (MaxScroll(st, page) > 0) {
+                st->contentDragPage = page;
+                st->contentDragStartY = pt.y;
+                st->contentDragStartScroll = st->pageScroll[page];
+                st->contentDragMoved = false;
+                SetCapture(hwnd);
+            }
             return 0;
         }
 
         case WM_MOUSEMOVE: {
-            if (!st || st->dragPage != page) break;
+            if (!st) break;
             POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-            RECT track{}, thumb{};
-            ScrollbarGeometry(st, page, track, thumb);
-            int thumbH = thumb.bottom - thumb.top;
-            int usable = (track.bottom - track.top) - thumbH;
-            int maxScroll = MaxScroll(st, page);
-            if (usable > 0 && maxScroll > 0) {
-                int delta = pt.y - st->dragStartY;
-                int scroll = st->dragStartScroll + delta * maxScroll / usable;
-                st->pageScroll[page] = std::max(0, std::min(maxScroll, scroll));
+            if (st->dragPage == page) {
+                RECT track{}, thumb{};
+                ScrollbarGeometry(st, page, track, thumb);
+                int thumbH = thumb.bottom - thumb.top;
+                int usable = (track.bottom - track.top) - thumbH;
+                int maxScroll = MaxScroll(st, page);
+                if (usable > 0 && maxScroll > 0) {
+                    int delta = pt.y - st->dragStartY;
+                    int scroll = st->dragStartScroll + delta * maxScroll / usable;
+                    st->pageScroll[page] = std::max(0, std::min(maxScroll, scroll));
+                    ApplyScroll(st, page);
+                }
+                return 0;
+            }
+            if (st->contentDragPage == page && GetCapture() == hwnd) {
+                int dy = pt.y - st->contentDragStartY;
+                if (!st->contentDragMoved) {
+                    if (std::abs(dy) < st->S(5)) return 0;
+                    st->contentDragMoved = true;
+                }
+                st->pageScroll[page] = st->contentDragStartScroll - dy;
                 ApplyScroll(st, page);
             }
             return 0;
         }
 
         case WM_LBUTTONUP:
-            if (st && st->dragPage == page) {
-                st->dragPage = -1;
-                ReleaseCapture();
+            if (st) {
+                if (st->dragPage == page) st->dragPage = -1;
+                if (st->contentDragPage == page) st->contentDragPage = -1;
+                if (GetCapture() == hwnd) ReleaseCapture();
+            }
+            return 0;
+
+        case WM_CAPTURECHANGED:
+            if (st) {
+                if (st->dragPage == page) st->dragPage = -1;
+                if (st->contentDragPage == page) st->contentDragPage = -1;
             }
             return 0;
 
@@ -2450,24 +2490,6 @@ static void OnCreate(HWND hwnd, SettingsState* st) {
             divider(page, rowY); y += st->S(kRowStep);
 
             rowY = y;
-            label(L"\u5237\u65b0\u65f6\u95f4", rowY, page);
-            int totalSec = st->cfg.articleRefreshSec;
-            int artH = totalSec / 3600;
-            int artM = (totalSec / 60) % 60;
-            int artS = totalSec % 60;
-            auto slots = makeSlots(rowY, {90, 14, 90, 14, 90, 14});
-            st->hEditArtH = stepper(page, slots[0], intText(artH).c_str(),
-                                    IDC_EDIT_ARTICLE_H, 0, 23, ES_NUMBER);
-            unit(page, slots[1], L"\u65f6");
-            st->hEditArtM = stepper(page, slots[2], intText(artM).c_str(),
-                                    IDC_EDIT_ARTICLE_M, 0, 59, ES_NUMBER);
-            unit(page, slots[3], L"\u5206");
-            st->hEditArtS = stepper(page, slots[4], intText(artS).c_str(),
-                                    IDC_EDIT_ARTICLE_S, 0, 59, ES_NUMBER);
-            unit(page, slots[5], L"\u79d2");
-            divider(page, rowY); y += st->S(kRowStep);
-
-            rowY = y;
             label(L"\u6b63\u6587\u5b57\u53f7", rowY, page);
             st->hEditArtFont = stepper(page, makeSlots(rowY, {110})[0],
                                        intText(st->cfg.articleFontSize).c_str(),
@@ -2776,21 +2798,6 @@ static bool CollectAndValidate(HWND hwnd, SettingsState* st) {
     }
     st->cfg.articlePlaceX = artX;
     st->cfg.articlePlaceY = artY;
-
-    int artH = 0, artM = 0, artS = 0;
-    if (!ParseIntField(st->hEditArtH, artH) ||
-        !ParseIntField(st->hEditArtM, artM) ||
-        !ParseIntField(st->hEditArtS, artS)) {
-        return ShowError(st, hwnd, PageArticle, st->hEditArtH,
-                         L"\u4e00\u6587\u5237\u65b0\u65f6\u95f4\u5fc5\u987b\u662f\u6574\u6570");
-    }
-    int artTotal = artH * 3600 + artM * 60 + artS;
-    if (artH < 0 || artH > 23 || artM < 0 || artM > 59 ||
-        artS < 0 || artS > 59 || artTotal < 1 || artTotal > 86399) {
-        return ShowError(st, hwnd, PageArticle, st->hEditArtH,
-                         L"\u4e00\u6587\u5237\u65b0\u65f6\u95f4\u5e94\u5728 00:00:01\u201323:59:59 \u4e4b\u95f4");
-    }
-    st->cfg.articleRefreshSec = artTotal;
 
     int artFont = 0;
     if (!ParseIntField(st->hEditArtFont, artFont) ||

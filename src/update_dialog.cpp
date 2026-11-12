@@ -264,7 +264,7 @@ static void OpenUrl(const std::wstring& url) {
 }
 
 static std::wstring ReleasePageUrl() {
-    return std::wstring(APP_UPDATE_URL) + L"/releases";
+    return APP_REPO_RELEASES_URL;
 }
 
 static void RevealInExplorer(const std::wstring& path) {
@@ -491,7 +491,7 @@ static void DoCheckUpdates(std::shared_ptr<SharedState> shared) {
     bool ok = false;
 
     HttpHandles h;
-    if (OpenHttpGet(h, L"https://api.github.com/repos/BUXIN-A/Countdown/releases/latest",
+    if (OpenHttpGet(h, APP_REPO_LATEST_API,
                     error)) {
         ok = ReadResponseText(h.request, body, error);
     }

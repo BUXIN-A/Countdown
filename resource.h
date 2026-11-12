@@ -56,12 +56,6 @@
 #define IDC_COMBO_ARTICLE_ANCHOR   3029
 #define IDC_EDIT_ARTICLE_X         3031
 #define IDC_EDIT_ARTICLE_Y         3032
-#define IDC_EDIT_ARTICLE_H         3033
-#define IDC_UD_ARTICLE_H           3034
-#define IDC_EDIT_ARTICLE_M         3035
-#define IDC_UD_ARTICLE_M           3036
-#define IDC_EDIT_ARTICLE_S         3037
-#define IDC_UD_ARTICLE_S           3038
 #define IDC_CHECK_ARTICLE_TOP      3039
 #define IDC_EDIT_ARTICLE_FONT      3040
 #define IDC_UD_ARTICLE_FONT        3041

@@ -1,5 +1,8 @@
 // =============================================================================
-// version.h - 程序版本（由 CMake 从 project() 版本号生成）
+// version.h - 程序版本与仓库信息（由 CMake 从 project() 与顶层变量生成）
+//
+// 统一配置入口：版本号、仓库 owner/name 均在 CMakeLists.txt 顶部定义，
+// 其他地址类宏在此派生，代码里不要再硬编码项目链接。
 // =============================================================================
 #pragma once
 
@@ -13,6 +16,11 @@
 #define APP_NAME    L"\u5012\u8ba1\u65f6"
 #define APP_NAME_EN L"Countdown"
 
-// 获取更新地址
-#define APP_UPDATE_URL L"https://github.com/BUXIN-A/Countdown"
-#define APP_UPDATE_URL_UTF8 "https://github.com/BUXIN-A/Countdown"
+// 仓库信息
+#define APP_REPO_OWNER L"@APP_REPO_OWNER@"
+#define APP_REPO_NAME  L"@APP_REPO_NAME@"
+#define APP_REPO_URL   L"https://github.com/@APP_REPO_OWNER@/@APP_REPO_NAME@"
+
+// 发布页与最新版本 API（检查更新使用）
+#define APP_REPO_RELEASES_URL APP_REPO_URL L"/releases"
+#define APP_REPO_LATEST_API   L"https://api.github.com/repos/@APP_REPO_OWNER@/@APP_REPO_NAME@/releases/latest"

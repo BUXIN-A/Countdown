@@ -14,6 +14,10 @@
 //   ArticleModule_Destroy
 //   ArticleModule_ApplyConfig
 //   ArticleModule_Select
+//   ArticleModule_GetRefreshSeconds   （可选）返回自动刷新间隔秒数，0 = 不自动刷新
+//
+// 刷新节奏由模块自己决定：例如 random 内容需要定时换文，周表只在跨天时变化。
+// 宿主在重建计划表时调用该导出；模块未导出时视为“不自动刷新”。
 //
 // schema JSON 示例：
 // {
@@ -88,6 +92,8 @@ typedef void* (*ArticleModuleCreateFn)(const ArticleModuleHostApi* host);
 typedef void (*ArticleModuleDestroyFn)(void* module);
 typedef void (*ArticleModuleApplyConfigFn)(void* module, const char* json);
 typedef int (*ArticleModuleSelectFn)(void* module, int current_index, int reason);
+// 可选导出：自动刷新间隔（秒），<=0 表示不参与定时刷新
+typedef int (*ArticleModuleGetRefreshSecondsFn)(void* module);
 
 #ifdef __cplusplus
 } // extern "C"

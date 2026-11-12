@@ -16,7 +16,7 @@ BEGIN
     BEGIN
         BLOCK "080404B0"
         BEGIN
-            VALUE "CompanyName",      "Bu Xin"
+            VALUE "CompanyName",      "@APP_AUTHOR@"
             VALUE "FileDescription",  "Countdown"
             VALUE "FileVersion",      "@PROJECT_VERSION@"
             VALUE "InternalName",     "Countdown"

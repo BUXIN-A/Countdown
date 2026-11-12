@@ -115,7 +115,6 @@ struct Config {
 
     // ---- article：内容 ----
     bool         articleEnabled = true;
-    int          articleRefreshSec = 300;
     int          articleFontSize = 15;
     std::wstring articleFont = L"";
     COLORREF     articleBackgroundColor = RGB(20, 20, 30);
