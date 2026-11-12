@@ -45,6 +45,8 @@ static const COLORREF kValueText  = RGB(233, 233, 240);
 static const COLORREF kAccent     = RGB(62, 94, 240);
 static const COLORREF kAccentHi   = RGB(92, 124, 255);
 static const COLORREF kDanger     = RGB(214, 92, 92);
+static const COLORREF kOnBg       = RGB(38, 48, 88);
+static const COLORREF kOnBorder   = RGB(80, 110, 255);
 
 // ---------------------------------------------------------------------------
 // 布局常量（96 DPI 逻辑像素）
@@ -79,6 +81,10 @@ enum UpdateButtonId {
     BtnRetry,
     BtnOpenFolder,
     BtnOpenRelease,
+    BtnLineDirect,
+    BtnLineMirror,
+    BtnRetryMirror,
+    BtnRetryDirect,
     BtnAssetBase = 1000,
 };
 
@@ -88,6 +94,8 @@ struct UiButton {
     std::wstring text;
     bool         primary = false;
     bool         small = false;
+    bool         toggle = false;   // 分段选择（直连/镜像）
+    bool         selected = false;
 };
 
 struct ReleaseAsset {
@@ -121,6 +129,7 @@ struct SharedState {
     std::wstring             dlPartialPath; // 正在写入的临时文件，取消/失败时删除
     std::wstring             dlError;
     int                      progress = 0;
+    long long                downloaded = 0; // 已下载字节，供无 Content-Length 时展示
 };
 
 enum class UpdateStage {
@@ -159,11 +168,17 @@ struct UpdateState {
     std::wstring downloadName;
     std::wstring savedPath;
     int  progress = 0;
+    bool indeterminate = false; // 服务器未返回 Content-Length 时用流动进度条
     int  detailScroll = 0;
     int  assetScroll = 0;
     int  detailContentH = 0;
     int  detailViewH = 0;
     int  spinPhase = 0;
+
+    // 下载线路（手动选择）
+    bool useMirror = false;
+    int  lastAssetIndex = -1;
+    bool lastUsedMirror = false;
 
     std::vector<UiButton> buttons;
     int  hoverBtn = BtnNone;
@@ -265,6 +280,15 @@ static void OpenUrl(const std::wstring& url) {
 
 static std::wstring ReleasePageUrl() {
     return APP_REPO_RELEASES_URL;
+}
+
+static bool MirrorAvailable() { return APP_MIRROR_PREFIX[0] != L'\0'; }
+
+// 镜像格式：<镜像前缀><原始 GitHub 链接>（前缀可带或不带结尾斜杠）
+static std::wstring MirrorUrl(const std::wstring& url) {
+    std::wstring prefix = APP_MIRROR_PREFIX;
+    if (!prefix.empty() && prefix.back() != L'/') prefix.push_back(L'/');
+    return prefix + url;
 }
 
 static void RevealInExplorer(const std::wstring& path) {
@@ -562,6 +586,7 @@ static void DoDownloadAsset(std::shared_ptr<SharedState> shared,
 
         long long written = 0;
         int lastPct = -1;
+        DWORD lastPost = 0;
         while (true) {
             if (shared->cancel.load()) {
                 cancelled = true;
@@ -592,20 +617,28 @@ static void DoDownloadAsset(std::shared_ptr<SharedState> shared,
                 break;
             }
             written += read;
-            if (total > 0) {
-                int pct = static_cast<int>(written * 100 / total);
-                if (pct > 100) pct = 100;
-                if (pct != lastPct) {
-                    lastPct = pct;
-                    {
-                        std::lock_guard<std::mutex> lock(shared->mtx);
-                        shared->progress = pct;
-                    }
-                    HWND hwnd = shared->hwnd.load();
-                    if (hwnd) {
-                        PostMessageW(hwnd, WM_UPDATE_PROGRESS,
-                                     static_cast<WPARAM>(pct), 0);
-                    }
+            {
+                std::lock_guard<std::mutex> lock(shared->mtx);
+                shared->downloaded = written;
+            }
+            // total <= 0 表示服务器未给 Content-Length（镜像分块传输常见），
+            // 此时上报 -1，由界面显示“已下载”字节数与流动进度条
+            int pct = (total > 0)
+                          ? static_cast<int>(
+                                std::min<long long>(100, written * 100 / total))
+                          : -1;
+            DWORD now = GetTickCount();
+            if (pct != lastPct || now - lastPost >= 150) {
+                lastPct = pct;
+                lastPost = now;
+                if (pct >= 0) {
+                    std::lock_guard<std::mutex> lock(shared->mtx);
+                    shared->progress = pct;
+                }
+                HWND hwnd = shared->hwnd.load();
+                if (hwnd) {
+                    PostMessageW(hwnd, WM_UPDATE_PROGRESS,
+                                 static_cast<WPARAM>(pct < 0 ? -1 : pct), 0);
                 }
             }
         }
@@ -694,6 +727,17 @@ static void AddButton(UpdateState* st, int id, RECT rc, const wchar_t* text,
     st->buttons.push_back(b);
 }
 
+static void AddToggle(UpdateState* st, int id, RECT rc, const wchar_t* text,
+                      bool selected) {
+    UiButton b;
+    b.id = id;
+    b.rc = rc;
+    b.text = text;
+    b.toggle = true;
+    b.selected = selected;
+    st->buttons.push_back(b);
+}
+
 static void BuildButtons(UpdateState* st, int w, int h) {
     st->buttons.clear();
     int pad = st->S(kPad);
@@ -723,6 +767,13 @@ static void BuildButtons(UpdateState* st, int w, int h) {
             } else if (st->stage == UpdateStage::DownloadFailed) {
                 rightBtn(BtnClose, 88, L"关闭", false, cursor);
                 rightBtn(BtnManual, 112, L"手动下载", true, cursor);
+                if (MirrorAvailable()) {
+                    if (st->lastUsedMirror) {
+                        rightBtn(BtnRetryDirect, 112, L"直连重试", false, cursor);
+                    } else {
+                        rightBtn(BtnRetryMirror, 112, L"镜像重试", false, cursor);
+                    }
+                }
             } else {
                 rightBtn(BtnClose, 88, L"关闭", true, cursor);
             }
@@ -732,6 +783,19 @@ static void BuildButtons(UpdateState* st, int w, int h) {
             rightBtn(BtnNo, 80, L"否", false, cursor);
             break;
         case UpdateStage::Assets:
+            if (MirrorAvailable()) {
+                // 标题右侧的线路切换：直连 / 镜像
+                int top = st->S(kHeaderH + 6);
+                int chipH = st->S(24);
+                int right = w - st->S(kPad);
+                int mirrorW = st->S(60);
+                int directW = st->S(56);
+                RECT mirrorRc{right - mirrorW, top, right, top + chipH};
+                RECT directRc{mirrorRc.left - st->S(6) - directW, top,
+                              mirrorRc.left - st->S(6), top + chipH};
+                AddToggle(st, BtnLineDirect, directRc, L"直连", !st->useMirror);
+                AddToggle(st, BtnLineMirror, mirrorRc, L"镜像", st->useMirror);
+            }
             rightBtn(BtnManual, 104, L"手动下载", false, cursor);
             rightBtn(BtnBack, 80, L"返回", false, cursor);
             if (st->info) {
@@ -844,6 +908,19 @@ static void DrawButton(HDC dc, UpdateState* st, const UiButton& b) {
     }
 
     int radius = std::min(st->S(8), static_cast<int>(b.rc.bottom - b.rc.top) / 2);
+    if (b.toggle) {
+        COLORREF fill = b.selected
+                            ? (pressed ? RGB(48, 60, 110) : kOnBg)
+                            : (pressed ? RGB(46, 46, 58)
+                                       : (hover ? RGB(42, 42, 54) : kChipBg));
+        COLORREF border = b.selected
+                              ? kOnBorder
+                              : (hover ? kAccent : kChipBorder);
+        FillRound(dc, b.rc, radius, fill, border);
+        DrawCentered(dc, b.rc, b.text, st->smallFont,
+                     b.selected ? kValueText : kLabel);
+        return;
+    }
     if (b.primary) {
         COLORREF fill = pressed ? RGB(48, 74, 196) : (hover ? kAccentHi : kAccent);
         FillRound(dc, b.rc, radius, fill, kAccentHi);
@@ -921,8 +998,14 @@ static void DrawAssets(UpdateState* st, HDC dc, int w, int h) {
 
     RECT hintRc{st->S(kPad), st->S(kHeaderH + 32), w - st->S(kPad),
                 st->S(kHeaderH + 50)};
-    DrawTextIn(dc, L"下载后将保存到系统的「下载」文件夹", hintRc, st->smallFont,
-               kMuted, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    std::wstring hint = L"下载后将保存到系统的「下载」文件夹";
+    if (MirrorAvailable() && st->useMirror) {
+        hint = std::wstring(L"当前线路：镜像 ") + APP_MIRROR_PREFIX;
+    } else if (MirrorAvailable()) {
+        hint += L" · 当前线路：直连 GitHub";
+    }
+    DrawTextIn(dc, hint, hintRc, st->smallFont, kMuted,
+               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
     int listTop = AssetListTop(st);
     int listBottom = h - st->S(kPad) - st->S(kBtnH) - st->S(12);
@@ -966,25 +1049,59 @@ static void DrawDownloading(UpdateState* st, HDC dc, int w, int h) {
     DrawTextIn(dc, st->downloadName, nameRc, st->font, kMuted,
                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
-    int barY = st->S(kHeaderH + 92);
+    RECT lineRc{st->S(kPad), st->S(kHeaderH + 66), w - st->S(kPad),
+                st->S(kHeaderH + 86)};
+    std::wstring line = st->lastUsedMirror
+                            ? (std::wstring(L"线路：镜像 ") + APP_MIRROR_PREFIX)
+                            : std::wstring(L"线路：直连 GitHub");
+    DrawTextIn(dc, line, lineRc, st->smallFont, kMuted,
+               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+    int barY = st->S(kHeaderH + 100);
     int barH = st->S(10);
     RECT track{st->S(kPad), barY, w - st->S(kPad), barY + barH};
     FillRound(dc, track, barH / 2, kChipBg, kChipBorder);
     int pct = std::max(0, std::min(100, st->progress));
-    int fillW = (track.right - track.left) * pct / 100;
-    if (fillW > 0) {
-        RECT fill{track.left, track.top, track.left + fillW, track.bottom};
-        FillRound(dc, fill, barH / 2, kAccent, kAccent);
+    if (st->indeterminate) {
+        // 镜像常见分块传输，无 Content-Length：用流动色块表示仍在下载
+        int trackW = track.right - track.left;
+        int blockW = std::max(st->S(70), trackW / 5);
+        int span = trackW + blockW;
+        int pos = (st->spinPhase * span / 24) % span - blockW;
+        int left = track.left + std::max(0, pos);
+        int right = track.left + std::min(trackW, pos + blockW);
+        if (right > left) {
+            RECT fill{left, track.top, right, track.bottom};
+            FillRound(dc, fill, barH / 2, kAccent, kAccent);
+        }
+    } else {
+        int fillW = (track.right - track.left) * pct / 100;
+        if (fillW > 0) {
+            RECT fill{track.left, track.top, track.left + fillW, track.bottom};
+            FillRound(dc, fill, barH / 2, kAccent, kAccent);
+        }
     }
 
+    std::wstring progressText;
+    if (st->indeterminate) {
+        long long downloaded = 0;
+        {
+            std::lock_guard<std::mutex> lock(st->shared->mtx);
+            downloaded = st->shared->downloaded;
+        }
+        progressText = L"已下载 ";
+        std::wstring size = FormatBytes(downloaded);
+        progressText += size.empty() ? L"0 B" : size;
+    } else {
+        progressText = std::to_wstring(pct) + L"%";
+    }
     RECT pctRc{st->S(kPad), barY + st->S(20), w - st->S(kPad),
                barY + st->S(44)};
-    DrawTextIn(dc, std::to_wstring(pct) + L"%" + L"        " + st->downloadName,
-               pctRc, st->smallFont, kMuted,
-               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    DrawTextIn(dc, progressText, pctRc, st->smallFont, kMuted,
+               DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-    RECT tipRc{st->S(kPad), barY + st->S(58), w - st->S(kPad),
-               barY + st->S(82)};
+    RECT tipRc{st->S(kPad), barY + st->S(48), w - st->S(kPad),
+               barY + st->S(72)};
     DrawTextIn(dc, L"下载过程中请勿关闭窗口，可随时点击「取消」。", tipRc,
                st->smallFont, kMuted, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 }
@@ -996,14 +1113,14 @@ static void DrawDownloadFailed(UpdateState* st, HDC dc, int w, int h) {
                DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
     RECT errRc{st->S(kPad), st->S(kHeaderH + 52), w - st->S(kPad),
-               st->S(kHeaderH + 118)};
+               st->S(kHeaderH + 142)};
     DrawTextIn(dc, st->errorText, errRc, st->font, kLabel,
                DT_LEFT | DT_WORDBREAK);
 
-    RECT tipRc{st->S(kPad), st->S(kHeaderH + 126), w - st->S(kPad),
-               st->S(kHeaderH + 150)};
-    DrawTextIn(dc, L"可以改用「手动下载」，在浏览器中直接获取文件。", tipRc,
-               st->font, kMuted, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    RECT tipRc{st->S(kPad), st->S(kHeaderH + 148), w - st->S(kPad),
+               st->S(kHeaderH + 176)};
+    DrawTextIn(dc, L"也可以使用「手动下载」，在浏览器中直接获取文件。", tipRc,
+               st->smallFont, kMuted, DT_LEFT | DT_WORDBREAK);
 }
 
 static void DrawDone(UpdateState* st, HDC dc, int w, int h) {
@@ -1020,6 +1137,14 @@ static void DrawDone(UpdateState* st, HDC dc, int w, int h) {
     RECT pathRc{st->S(kPad), st->S(kHeaderH + 78), w - st->S(kPad),
                 st->S(kHeaderH + 150)};
     DrawTextIn(dc, st->savedPath, pathRc, st->font, kLabel, DT_LEFT | DT_WORDBREAK);
+
+    if (st->lastUsedMirror) {
+        RECT lineRc{st->S(kPad), st->S(kHeaderH + 156), w - st->S(kPad),
+                    st->S(kHeaderH + 180)};
+        DrawTextIn(dc, std::wstring(L"已通过镜像下载：") + APP_MIRROR_PREFIX,
+                   lineRc, st->smallFont, kMuted,
+                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
 }
 
 static void DrawFailed(UpdateState* st, HDC dc, int w, int h) {
@@ -1108,6 +1233,7 @@ static void ResetShared(UpdateState* st) {
     st->shared->dlPartialPath.clear();
     st->shared->dlError.clear();
     st->shared->progress = 0;
+    st->shared->downloaded = 0;
 }
 
 static void StartCheck(UpdateState* st) {
@@ -1136,17 +1262,25 @@ static void StartDownload(UpdateState* st, int index) {
     std::wstring name = SanitizeFileName(asset.name);
     std::wstring path = MakeUniquePath(DownloadsDir(), name);
 
+    bool useMirror = st->useMirror && MirrorAvailable();
+    std::wstring url = useMirror ? MirrorUrl(asset.url) : asset.url;
+
     st->downloadName = asset.name;
     st->progress = 0;
+    st->indeterminate = false;
+    st->lastAssetIndex = index;
+    st->lastUsedMirror = useMirror;
     st->stage = UpdateStage::Downloading;
     st->shared->cancel.store(false);
     {
         std::lock_guard<std::mutex> lock(st->shared->mtx);
         st->shared->progress = 0;
+        st->shared->downloaded = 0;
     }
+    // 下载期间用定时器驱动无 Content-Length 时的流动进度条
+    SetTimer(st->hwnd, 1, 60, nullptr);
 
     std::shared_ptr<SharedState> shared = st->shared;
-    std::wstring url = asset.url;
     std::thread([shared, url, path]() {
         DoDownloadAsset(shared, url, path);
     }).detach();
@@ -1181,6 +1315,30 @@ static void DoButtonAction(UpdateState* st, int id) {
             break;
         case BtnCancelDownload:
             st->shared->cancel.store(true);
+            break;
+        case BtnLineDirect:
+            if (st->useMirror) {
+                st->useMirror = false;
+                InvalidateRect(st->hwnd, nullptr, FALSE);
+            }
+            break;
+        case BtnLineMirror:
+            if (!st->useMirror) {
+                st->useMirror = true;
+                InvalidateRect(st->hwnd, nullptr, FALSE);
+            }
+            break;
+        case BtnRetryMirror:
+            if (st->lastAssetIndex >= 0 && MirrorAvailable()) {
+                st->useMirror = true;
+                StartDownload(st, st->lastAssetIndex);
+            }
+            break;
+        case BtnRetryDirect:
+            if (st->lastAssetIndex >= 0) {
+                st->useMirror = false;
+                StartDownload(st, st->lastAssetIndex);
+            }
             break;
         case BtnRetry:
             StartCheck(st);
@@ -1281,9 +1439,20 @@ static LRESULT CALLBACK UpdateWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         }
         case WM_TIMER:
-            if (st && wp == 1 && st->stage == UpdateStage::Checking) {
-                st->spinPhase = (st->spinPhase + 1) % 8;
-                InvalidateRect(hwnd, nullptr, FALSE);
+            if (st && wp == 1) {
+                if (st->stage == UpdateStage::Checking) {
+                    st->spinPhase = (st->spinPhase + 1) % 8;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                } else if (st->stage == UpdateStage::Downloading) {
+                    // 有 Content-Length 时不需要动画，但仍保留定时器，
+                    // 以便后续切换到无长度（流动条）模式时立即生效
+                    if (st->indeterminate) {
+                        st->spinPhase = (st->spinPhase + 1) % 24;
+                        InvalidateRect(hwnd, nullptr, FALSE);
+                    }
+                } else {
+                    KillTimer(hwnd, 1);
+                }
             }
             return 0;
         case WM_NCHITTEST: {
@@ -1432,7 +1601,12 @@ static LRESULT CALLBACK UpdateWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         case WM_UPDATE_PROGRESS: {
             if (st) {
-                st->progress = static_cast<int>(wp);
+                if (wp == static_cast<WPARAM>(-1)) {
+                    st->indeterminate = true;
+                } else {
+                    st->indeterminate = false;
+                    st->progress = static_cast<int>(wp);
+                }
                 if (st->stage == UpdateStage::Downloading) {
                     InvalidateRect(hwnd, nullptr, FALSE);
                 }
@@ -1457,14 +1631,21 @@ static LRESULT CALLBACK UpdateWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
             // worker 未能删除时（偶发占用）在这里再兜底删除一次
             if (!ok && !partial.empty()) RemoveFileBestEffort(partial);
+            KillTimer(hwnd, 1);
             if (cancelled) {
                 st->stage = UpdateStage::Assets;
             } else if (ok) {
                 st->savedPath = path;
                 st->progress = 100;
+                st->indeterminate = false;
                 st->stage = UpdateStage::Done;
             } else {
                 st->errorText = error.empty() ? L"下载失败" : error;
+                if (MirrorAvailable() && !st->lastUsedMirror) {
+                    st->errorText += L"\n可点击「镜像重试」改用镜像线路。";
+                } else if (MirrorAvailable() && st->lastUsedMirror) {
+                    st->errorText += L"\n可切换回「直连」线路再次尝试。";
+                }
                 st->stage = UpdateStage::DownloadFailed;
             }
             InvalidateRect(hwnd, nullptr, TRUE);

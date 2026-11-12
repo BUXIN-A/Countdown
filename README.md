@@ -63,6 +63,7 @@
 - 「关于」页点击「获取更新」后直接查询 GitHub Release 最新版本
 - 有新版本时展示版本号与更新详情，可选择是否更新
 - 附件列表支持直接下载到系统「下载」文件夹，或跳转浏览器手动下载
+- 附件下载可切换线路：直连 GitHub 或镜像（默认 `https://gh-proxy.com/`），失败后可一键换线重试
 - 下载过程显示百分比进度，可随时取消；失败时自动回退到手动下载
 - 查询失败时自动打开项目发布页
 
@@ -198,7 +199,7 @@ src/
   utils.cpp/.h                 DPI、字体、颜色、网络等工具
   json.h                       轻量 JSON 解析/序列化
   version.h.in / version.rc.in 版本号模板（CMake 生成）
-CMakeLists.txt                 构建脚本（exe + 模块 DLL）；版本号与仓库地址的唯一配置入口
+CMakeLists.txt                 构建脚本（exe + 模块 DLL）；版本号、仓库地址、下载镜像的唯一配置入口
 resource.h / resource.rc       图标、控件 ID、自定义消息
 countdown.ico                  应用图标
 app.manifest                   DPI 感知与主题清单

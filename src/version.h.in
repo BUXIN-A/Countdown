@@ -24,3 +24,6 @@
 // 发布页与最新版本 API（检查更新使用）
 #define APP_REPO_RELEASES_URL APP_REPO_URL L"/releases"
 #define APP_REPO_LATEST_API   L"https://api.github.com/repos/@APP_REPO_OWNER@/@APP_REPO_NAME@/releases/latest"
+
+// 附件下载镜像前缀：拼接在原始 GitHub 链接之前即可加速下载
+#define APP_MIRROR_PREFIX L"@APP_MIRROR_PREFIX@"

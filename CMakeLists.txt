@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(Countdown VERSION 2.3.2 LANGUAGES CXX)
+project(Countdown VERSION 2.3.3 LANGUAGES CXX)
 
 # -----------------------------------------------------------------------------
 # 统一配置入口：版本号、仓库信息只在这里维护
@@ -8,6 +8,8 @@ project(Countdown VERSION 2.3.2 LANGUAGES CXX)
 set(APP_REPO_OWNER "BUXIN-A")
 set(APP_REPO_NAME  "Countdown")
 set(APP_AUTHOR      "Bu Xin")
+# Release 附件下载镜像前缀（留空则不提供镜像线路）
+set(APP_MIRROR_PREFIX "https://gh-proxy.com/")
 
 
 set(CMAKE_CXX_STANDARD 17)
