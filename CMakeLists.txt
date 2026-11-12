@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(Countdown VERSION 2.3.4 LANGUAGES CXX)
+project(Countdown VERSION 2.3.5 LANGUAGES CXX)
 
 # -----------------------------------------------------------------------------
 # 统一配置入口：版本号、仓库信息只在这里维护
